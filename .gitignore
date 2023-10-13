@@ -1,3 +1,8 @@
+# Files that should be ignored by git (results of runs, data, etc.)
+output/
+data/
+.vscode/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
