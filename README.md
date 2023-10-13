@@ -9,6 +9,8 @@ To get the ground truth infos about an environment, run `python3 scripts/get_gro
 - `v_grid.png`: Heatmap of V values (grid)
 - `q.npz`: Optimal Q values.
 - `q_grid.npz`: Optimal Q values (grid)
+- `count_grid.npz`: Count of tabular states corresponding to each grid state.
+- `count_grid.png`: Heatmap of count of tabular states corresponding to each grid state.
 - `path.npz`: Optimal path.
 - `policy.png`: Directions to take at each state *(only displays the forward action)* on top of the heatmap of V values.
 - `mapping.pkl`: Mapping of tabular state (`int`) to game state (`GameState`).

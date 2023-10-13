@@ -99,7 +99,7 @@ def construct_value_grid_from_tabular(
     width: int,
     height: int,
     args: Optional[Dict[str, Any]] = None,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """Construct a grid of the Q or V values from the tabular values.
 
     Args:
@@ -112,6 +112,7 @@ def construct_value_grid_from_tabular(
 
     Returns:
         grid: Grid of Q (width, height, num_actions) or V (width, height) values.
+        count: Number of times each cell was visited.
     """
     shape = (width, height) if len(tab.shape) == 1 else (width, height, tab.shape[1])
     grid = np.zeros(shape)
@@ -128,7 +129,7 @@ def construct_value_grid_from_tabular(
     if grid.shape != count.shape:
         count = np.expand_dims(count, axis=-1)
     grid = grid / np.maximum(count, 1)
-    return grid
+    return grid, count
 
 
 def plot_game_state(game_state: GameState):
@@ -233,10 +234,17 @@ def main(args: argparse.Namespace):
         pickle.dump(mapping, f)
 
     # Make a grid of the values
-    V_grid = construct_value_grid_from_tabular(V, mapping, width, height)
+    V_grid, count = construct_value_grid_from_tabular(V, mapping, width, height)
     np.savez(f"{save_dir}/v_grid.npz", V_grid)
-    Q_grid = construct_value_grid_from_tabular(Q, mapping, width, height)
+    np.savez(f"{save_dir}/count_grid.npz", count)
+    Q_grid, _ = construct_value_grid_from_tabular(Q, mapping, width, height)
     np.savez(f"{save_dir}/q_grid.npz", Q_grid)
+
+    # Plot the count
+    plt.figure(figsize=(20, 16))
+    plt.imshow(count.T)
+    plt.colorbar()
+    plt.savefig(f"{save_dir}/count_grid.png")
 
     # Plot the grid
     plt.figure(figsize=(20, 16))
@@ -245,6 +253,10 @@ def main(args: argparse.Namespace):
     plt.savefig(f"{save_dir}/v_grid.png")
     draw_optimal_path(mapping=mapping, transitions=transitions, Q=Q)
     plt.savefig(f"{save_dir}/path.png")
+
+    # Make a new figure
+    plt.figure(figsize=(20, 16))
+    plt.imshow(V_grid.T)
     draw_policy(mapping=mapping, Q=Q)
     plt.savefig(f"{save_dir}/policy.png")
 
