@@ -44,6 +44,14 @@ class GroundTruth:
     # Rewards vector
     rewards: np.ndarray  # (num_states, num_actions)
 
+    @property
+    def width(self) -> int:
+        return self.V_grid.shape[0]
+
+    @property
+    def height(self) -> int:
+        return self.V_grid.shape[1]
+
 
 def compute_ground_truth(
     env_name: str, data_dir: str, horizon: int = 100, gamma: float = 0.95

@@ -204,19 +204,22 @@ class TabularStateToGameStateMapper:
 
 class TabularWorld:
     def __init__(self, filename: str, num_worlds: int, device: str):
+        self.num_worlds = num_worlds
+        self.device = device
+
         transitions, rewards = load_mdp_from_npz(filename)
         # Core transition matrix
         self.transitions = torch.tensor(transitions, device=device)
         self.transition_rewards = torch.tensor(rewards, device=device)
+
         # Current state
-        self.observations = torch.zeros(
-            (num_worlds, 1), dtype=torch.int32, device=device
-        )
-        self.actions = torch.zeros((num_worlds, 1), dtype=torch.int32, device=device)
-        self.dones = torch.zeros((num_worlds, 1), dtype=torch.int32, device=device)
-        self.rewards = torch.zeros((num_worlds, 1), device=device)
+        self.observations = torch.zeros((num_worlds,), dtype=torch.int32, device=device)
+        self.actions = torch.zeros((num_worlds,), dtype=torch.int32, device=device)
+        self.dones = torch.zeros((num_worlds,), dtype=torch.int32, device=device)
+        self.rewards = torch.zeros((num_worlds,), device=device)
+
         # Flag for reset per world
-        self.force_reset = torch.zeros(num_worlds, dtype=torch.int32, device=device)
+        self.force_reset = torch.zeros((num_worlds,), dtype=torch.int32, device=device)
 
     @property
     def num_states(self) -> int:
@@ -240,9 +243,15 @@ class TabularWorld:
         # print("Observations", self.observations)
         # print(self.transition_rewards[self.observations])
         # print(self.transition_rewards[self.observations, self.actions])
-        self.rewards[...] = self.transition_rewards[self.observations, self.actions]
-        self.observations[...] = self.transitions[self.observations, self.actions]
-        self.dones[...] = (self.observations == self.transitions.shape[0] - 1).int()
+        self.rewards[...] = self.transition_rewards[
+            self.observations, self.actions
+        ].squeeze()
+        self.observations[...] = self.transitions[
+            self.observations, self.actions
+        ].squeeze()
+        self.dones[...] = (
+            (self.observations == self.transitions.shape[0] - 1).int().squeeze()
+        )
         # Reset all the dones
         # print(self.observations.shape)
         # print(self.dones.shape)
