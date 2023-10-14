@@ -14,5 +14,7 @@ To get the ground truth infos about an environment, run `python3 scripts/get_gro
 - `path.npz`: Optimal path.
 - `policy.png`: Directions to take at each state *(only displays the forward action)* on top of the heatmap of V values.
 - `mapping.pkl`: Mapping of tabular state (`int`) to game state (`GameState`).
+- `transitions.npz`: Transitions array of the environment. (tabular)
+- `rewards.npz`: Rewards array of the environment. (tabular)
 
 You can generate the ground truth for all environments by running `sh scripts/computer_all_ground_truths.sh`.
