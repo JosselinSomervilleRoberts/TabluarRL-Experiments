@@ -7,7 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from algorithms.construct_mapping import construct_mapping
+from envs.mapping import construct_mapping
 from algorithms.value_iteration import run_value_iteration
 from envs.tabular_world import TabularWorld, GameState
 from envs.mdp_utils import get_sparse_mdp, load_mdp_from_npz
