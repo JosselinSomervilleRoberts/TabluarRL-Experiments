@@ -67,6 +67,17 @@ class Logger:
             self.last_log_time_s = -1
             self.last_log_step = -1
 
+            # Q-learning (fast logging preparation)
+            self.first_log_q_values: bool = True
+            self.device = env.device
+            self.coordinates = torch.tensor(
+                [
+                    (self.gt.mapping[tabular_state].x, self.gt.mapping[tabular_state].y)
+                    for tabular_state in self.gt.mapping
+                ],
+                device=env.device,
+            )
+
     def log(self, step, **kwargs):
         if not self.started:
             raise Exception("Logger not started!")
@@ -75,7 +86,7 @@ class Logger:
         if self.last_log_time_s >= 0:
             dt = time_s - self.last_log_time_s
             steps_per_s = (step - self.last_log_step) * self.num_worlds / dt
-            kwargs["steps_per_s"] = steps_per_s
+            self.add_to_buffer(steps_per_s=steps_per_s)
         self.last_log_time_s = time_s
         self.last_log_step = step
 
@@ -95,31 +106,44 @@ class Logger:
                     self.buffers[title] = LoggingBuffer()
                 self.buffers[title].append(value)
 
+    def fast_construct_value_grid_from_tabular(self, V: torch.Tensor) -> np.ndarray:
+        """Construct a grid of the V values from the tabular values.
+        This function is faster than construct_value_grid_from_tabular
+        because it precomputes the coordinates of each tabular state.
+        in start().
+        """
+        grid = torch.zeros((self.gt.width, self.gt.height), device=self.device)
+        count = torch.zeros((self.gt.width, self.gt.height), device=self.device)
+        grid[self.coordinates[:, 0], self.coordinates[:, 1]] += V
+        count[self.coordinates[:, 0], self.coordinates[:, 1]] += 1
+        count[count == 0] = 1
+        grid /= count
+        return grid.cpu().numpy()
+
     def log_q_values(self, step):
         if self.log_mode != "wandb":
             return
 
-        # Creates a mapping of titles to images to log
-        images: Dict[str, np.ndarray] = {}
+        # Log images
         gt: GroundTruth = load_ground_truth(env_name)
-        Q: np.ndarray = self.q_values.cpu().numpy()
-        V: np.ndarray = np.max(Q, axis=1)
-        V_grid, _ = construct_value_grid_from_tabular(
-            V, gt.mapping, gt.width, gt.height
-        )
-        images["Learned V"] = V_grid.T.copy()
+        V: torch.Tensor = torch.max(self.q_values, axis=1).values
+        V_grid = self.fast_construct_value_grid_from_tabular(V)
+        wandb.log({"Learned V": wandb.Image(V_grid.T)}, step=step * self.num_worlds)
 
         # Renormalize for comparison
         if np.max(V_grid) > 0:
             V_grid *= np.max(gt.V_grid) / np.max(V_grid)
-        images["Difference"] = np.abs(V_grid.T - gt.V_grid.T).copy()
+        wandb.log(
+            {"Difference": wandb.Image(np.abs(V_grid.T - gt.V_grid.T))},
+            step=step * self.num_worlds,
+        )
 
-        images["Ground truth V"] = gt.V_grid.T.copy()
-
-        # Log the images
-        if self.log_mode == "wandb":
-            for title, image in images.items():
-                wandb.log({title: wandb.Image(image)}, step=step * self.num_worlds)
+        if self.first_log_q_values:
+            wandb.log(
+                {"Ground truth V": wandb.Image(gt.V_grid.T)},
+                step=step * self.num_worlds,
+            )
+            self.first_log_q_values = False
 
 
 @dataclass
