@@ -1,11 +1,80 @@
 # Code a tabular Q-learning algorithm that learns the optimal policy for the tabular world.
 
 from dataclasses import dataclass
+from typing import Dict, Optional
 
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from tqdm import tqdm
+import wandb
 
-from envs.tabular_world import TabularWorld, GameState
+from algorithms.constants import WANDB_PROJECT_NAME
+from envs.tabular_world import TabularWorld
+from envs.ground_truth import load_ground_truth, GroundTruth
+from envs.mapping import construct_value_grid_from_tabular
+
+
+class Logger:
+    def __init__(self, log_mode: Optional[str] = "wandb"):
+        self.log_mode: Optional[str] = log_mode
+        self.started: bool = False
+
+    def start(
+        self,
+        run_name: str,
+        env_name: str,
+        group_name: Optional[str] = None,
+        params: Optional[dict] = None,
+        q_values: Optional[torch.Tensor] = None,
+    ):
+        if self.log_mode == "wandb":
+            wandb.init(
+                project=WANDB_PROJECT_NAME,
+                group=group_name,
+                name=run_name,
+                monitor_gym=True,
+                save_code=True,
+                config=params,
+            )
+            self.q_values = q_values
+
+        if self.log_mode is not None:
+            self.gt = load_ground_truth(env_name)
+            self.started = True
+
+    def log(self, step, **kwargs):
+        if not self.started:
+            raise Exception("Logger not started!")
+
+        if self.log_mode == "wandb":
+            wandb.log(kwargs, step=step)
+
+    def log_q_values(self, step):
+        if self.log_mode != "wandb":
+            return
+
+        # Creates a mapping of titles to images to log
+        images: Dict[str, np.ndarray] = {}
+        gt: GroundTruth = load_ground_truth(env_name)
+        Q: np.ndarray = self.q_values.cpu().numpy()
+        V: np.ndarray = np.max(Q, axis=1)
+        V_grid, _ = construct_value_grid_from_tabular(
+            V, gt.mapping, gt.width, gt.height
+        )
+        images["Learned V"] = V_grid.T.copy()
+
+        # Renormalize for comparison
+        if np.max(V_grid) > 0:
+            V_grid *= np.max(gt.V_grid) / np.max(V_grid)
+        images["Difference"] = np.abs(V_grid.T - gt.V_grid.T).copy()
+
+        images["Ground truth V"] = gt.V_grid.T.copy()
+
+        # Log the images
+        if self.log_mode == "wandb":
+            for title, image in images.items():
+                wandb.log({title: wandb.Image(image)}, step=step)
 
 
 @dataclass
@@ -29,9 +98,18 @@ class QLearningResults:
 
 
 class QLearning:
-    def __init__(self, params: QLearningParameters, env: TabularWorld):
+    LOG_VALUES_EVERY = 10
+    LOG_Q_VALUES_EVERY = 100
+
+    def __init__(
+        self,
+        params: QLearningParameters,
+        env: TabularWorld,
+        log_mode: Optional[str] = "wandb",
+    ):
         self.params = params
         self.env = env
+        self.logger = Logger(log_mode=log_mode)
 
         # Initialize Q-values for each state-action pair
         self.q_values = torch.zeros(
@@ -43,6 +121,16 @@ class QLearning:
         self.results = QLearningResults()
 
     def train(self):
+        run_name: str = f"env={self.env.name},lr={self.params.learning_rate},gamma={self.params.discount_factor},eps={self.params.exploration_prob_start}-{self.params.exploration_prob_end},episodes={self.params.max_num_episodes}"
+        group_name: str = "q-learning"
+        self.logger.start(
+            run_name=run_name,
+            env_name=self.env.name,
+            group_name=group_name,
+            params=self.params,
+            q_values=self.q_values,
+        )
+
         for episode in tqdm(range(self.params.max_num_episodes), desc="Training"):
             self.env.reset()  # Reset all parallel environments
             episode_reward = torch.zeros(
@@ -57,6 +145,7 @@ class QLearning:
                 * episode
                 / self.params.max_num_episodes
             )
+            learning_rate = self.params.learning_rate
 
             for step in range(self.params.max_steps_per_episode):
                 current_state: torch.Tensor = self.env.observations.clone()
@@ -88,17 +177,29 @@ class QLearning:
                     self.env.rewards + self.params.discount_factor * v_value_of_next
                 )
                 self.q_values[current_state, self.env.actions] = (
-                    1 - self.params.learning_rate
+                    1 - learning_rate
                 ) * self.q_values[
                     current_state, self.env.actions
-                ] + self.params.learning_rate * q_target
+                ] + learning_rate * q_target
 
                 # Update the cumulative rewards
                 episode_reward += self.env.rewards
 
                 # Check if any of the environments are done
+                # TODO: Change this to only reset the environments that are done
                 if torch.any(self.env.dones):
                     break
+
+            if episode % self.LOG_VALUES_EVERY == 0:
+                self.logger.log(
+                    episode,
+                    episode_reward=episode_reward.mean().item(),
+                    epsilon=epsilon,
+                    learning_rate=learning_rate,
+                    duration=step + 1,
+                )
+            if episode % self.LOG_Q_VALUES_EVERY == 0:
+                self.logger.log_q_values(episode)
 
             # self.results.total_rewards.append(episode_reward)
             # self.results.total_steps.append(step + 1)
@@ -108,11 +209,6 @@ class QLearning:
 
 
 if __name__ == "__main__":
-    from envs.ground_truth import load_ground_truth, GroundTruth
-    from envs.mapping import construct_value_grid_from_tabular
-    import matplotlib.pyplot as plt
-    import numpy as np
-
     # Create the tabular world
     env_name = "MiniGrid-BlockedUnlockPickup-v0"
     # env_name = "MiniGrid-Empty-8x8-v0"
@@ -129,7 +225,7 @@ if __name__ == "__main__":
         discount_factor=0.95,
         exploration_prob_start=1.0,
         exploration_prob_end=0.05,
-        max_num_episodes=4000,
+        max_num_episodes=1000,
         max_steps_per_episode=100,
     )
 

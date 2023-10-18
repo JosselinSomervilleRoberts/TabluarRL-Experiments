@@ -204,6 +204,7 @@ class TabularStateToGameStateMapper:
 
 class TabularWorld:
     def __init__(self, filename: str, num_worlds: int, device: str):
+        self.name = filename.split("/")[-2]
         self.num_worlds = num_worlds
         self.device = device
 
