@@ -258,14 +258,19 @@ class TabularWorld:
         # print(self.dones.shape)
         self.observations[self.dones == 1] = 0
 
-    def reset(self) -> torch.Tensor:
-        """Reset the environment.
+    def reset(self, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Reset the environment for the worlds specified by the mask.
+        if not specified, reset all worlds.
+
+        Args:
+            mask: The mask of the worlds to reset. If None, resets all worlds.
 
         Returns:
             observations: The initial observations.
         """
-        # Reset all the dones
-        self.observations[self.dones == 1] = 0
+        if mask is None:
+            mask = torch.ones((self.num_worlds,), dtype=torch.int32, device=self.device)
+        self.observations[mask] = 0
         self.force_reset[...] = 1
         self.dones[...] = 0
         self.rewards[...] = 0
