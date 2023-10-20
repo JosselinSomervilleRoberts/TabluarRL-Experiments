@@ -103,6 +103,7 @@ def construct_value_grid_from_tabular(
     mapping: Dict[int, GameState],
     width: int,
     height: int,
+    progress: bool = True,
     args: Optional[Dict[str, Any]] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Construct a grid of the Q or V values from the tabular values.
@@ -122,7 +123,7 @@ def construct_value_grid_from_tabular(
     shape = (width, height) if len(tab.shape) == 1 else (width, height, tab.shape[1])
     grid = np.zeros(shape)
     count = np.zeros((width, height))
-    for tabular_state in tqdm(mapping, desc="Making grid"):
+    for tabular_state in tqdm(mapping, desc="Making grid", disable=not progress):
         game_state: GameState = mapping[tabular_state]
         if args is not None and "only_if_object_is" in args:
             if game_state.object != args["only_if_object_is"]:

@@ -127,7 +127,11 @@ class Logger:
         # Log images
         gt: GroundTruth = load_ground_truth(env_name)
         V: torch.Tensor = torch.max(self.q_values, axis=1).values
-        V_grid = self.fast_construct_value_grid_from_tabular(V)
+        V_grid, _ = construct_value_grid_from_tabular(
+            V, gt.mapping, gt.width, gt.height, progress=False
+        )
+        # Does not seem to work
+        # V_grid = self.fast_construct_value_grid_from_tabular(V)
         wandb.log({"Learned V": wandb.Image(V_grid.T)}, step=step * self.num_worlds)
 
         # Renormalize for comparison
@@ -151,10 +155,12 @@ class QLearningParameters:
     num_states: int  # Number of states in the environment
     num_actions: int  # Number of actions in the environment
     num_worlds: int  # Number of parallel environments
-    learning_rate: float  # Learning rate (alpha)
+    learning_rate_start: float  # Learning rate (alpha)
+    learning_rate_end: float  # Learning rate (alpha)
     discount_factor: float  # Discount factor (gamma)
     exploration_prob_start: float  # Epsilon for epsilon-greedy policy
     exploration_prob_end: float  # Epsilon for epsilon-greedy policy
+    exploration_step_end: int  # Step at which epsilon reaches exploration_prob_end
     total_num_steps: int  # Maximum number of episodes for training
     max_steps_per_episode: int  # Maximum steps per episode
 
@@ -168,7 +174,7 @@ class QLearningResults:
 
 class QLearning:
     LOG_VALUES_EVERY = 10
-    LOG_Q_VALUES_EVERY = 100
+    LOG_Q_VALUES_EVERY = 500000
 
     def __init__(
         self,
@@ -190,7 +196,7 @@ class QLearning:
         self.results = QLearningResults()
 
     def train(self):
-        run_name: str = f"env={self.env.name},lr={self.params.learning_rate},gamma={self.params.discount_factor},eps={self.params.exploration_prob_start}-{self.params.exploration_prob_end},episodes={self.params.total_num_steps}"
+        run_name: str = f"env={self.env.name},lr={self.params.learning_rate_start},gamma={self.params.discount_factor},eps={self.params.exploration_prob_start}-{self.params.exploration_prob_end},episodes={self.params.total_num_steps}"
         group_name: str = "q-learning"
         self.logger.start(
             run_name=run_name,
@@ -215,10 +221,6 @@ class QLearning:
             range(self.params.total_num_steps),
             desc="Training",
         ):
-            self.env.reset()  # Reset all parallel environments
-            # episode_reward = torch.zeros(
-            #     (self.params.num_worlds), device=self.env.device
-            # )
             epsilon = (
                 self.params.exploration_prob_start
                 + (
@@ -226,9 +228,16 @@ class QLearning:
                     - self.params.exploration_prob_start
                 )
                 * step
+                / self.params.exploration_step_end
+            )
+            if epsilon < self.params.exploration_prob_end:
+                epsilon = self.params.exploration_prob_end
+            learning_rate = (
+                self.params.learning_rate_start
+                + (self.params.learning_rate_end - self.params.learning_rate_start)
+                * step
                 / self.params.total_num_steps
             )
-            learning_rate = self.params.learning_rate
 
             current_state: torch.Tensor = self.env.observations.clone()
 
@@ -237,6 +246,7 @@ class QLearning:
             explore = (
                 torch.rand((self.params.num_worlds), device=self.env.device) < epsilon
             )
+            self.logger.add_to_buffer(num_explore=torch.sum(explore).cpu().item())
             self.env.actions[explore] = torch.randint(
                 self.params.num_actions,
                 (torch.sum(explore),),
@@ -245,6 +255,7 @@ class QLearning:
             )
             # Others will exploit
             exploit = ~explore
+            self.logger.add_to_buffer(num_exploits=torch.sum(exploit).cpu().item())
             Q_values = self.q_values[current_state[exploit]]
             self.env.actions[exploit] = torch.argmax(Q_values, axis=1).int()
 
@@ -255,6 +266,7 @@ class QLearning:
             # Update Q-values using the Q-learning update rule
             v_value_of_next = torch.max(self.q_values[next_state], axis=1).values
             q_target = self.env.rewards + self.params.discount_factor * v_value_of_next
+            q_target[self.env.dones == 1] = self.env.rewards[self.env.dones == 1]
             self.q_values[current_state, self.env.actions] = (
                 1 - learning_rate
             ) * self.q_values[
@@ -270,6 +282,8 @@ class QLearning:
 
             # Check if any of the environments are done
             if torch.any(self.env.dones):
+                if torch.any(self.env.rewards[self.env.dones == 1] == 0):
+                    print("Reward is 0!")
                 self.logger.add_to_buffer(
                     avg_duration_to_success=num_steps_in_episode[self.env.dones == 1]
                 )
@@ -297,8 +311,8 @@ class QLearning:
                     num_successes=num_successes,
                     num_failures=num_failures,
                 )
-            if step % self.LOG_Q_VALUES_EVERY == 0:
-                self.logger.log_q_values(step)
+            # if step % self.LOG_Q_VALUES_EVERY == 0:
+            #     self.logger.log_q_values(step)
 
             # self.results.total_rewards.append(episode_reward)
             # self.results.total_steps.append(step + 1)
@@ -320,12 +334,14 @@ if __name__ == "__main__":
         num_states=world.num_states,
         num_actions=world.num_actions,
         num_worlds=world.num_worlds,
-        learning_rate=0.1,
+        learning_rate_start=0.2,
+        learning_rate_end=0.0001,
         discount_factor=0.95,
-        exploration_prob_start=1.0,
-        exploration_prob_end=0.05,
-        total_num_steps=2000,
-        max_steps_per_episode=100,
+        exploration_prob_start=0.5,
+        exploration_prob_end=0.1,
+        exploration_step_end=2500,
+        total_num_steps=5000,
+        max_steps_per_episode=70,
     )
 
     # Create the Q-learning algorithm
@@ -342,23 +358,28 @@ if __name__ == "__main__":
     gt: GroundTruth = load_ground_truth(env_name)
     Q: np.ndarray = results.q_values[-1]
     V: np.ndarray = np.max(Q, axis=1)
-    print("Q shape:", Q.shape)
     V_grid, _ = construct_value_grid_from_tabular(V, gt.mapping, gt.width, gt.height)
-    print("V grid shape:", V_grid.shape)
-    V_grid *= np.max(gt.V_grid) / np.max(V_grid)
+    rewards_grid, _ = construct_value_grid_from_tabular(
+        gt.rewards, gt.mapping, gt.width, gt.height
+    )
+    # V_grid *= np.max(gt.V_grid) / np.max(V_grid)
 
     # Plot the results
     plt.figure(figsize=(24, 8))
-    plt.subplot(1, 3, 1)
+    plt.subplot(1, 4, 1)
     plt.imshow(V_grid.T)
     plt.colorbar()
     plt.title("Q-learning")
-    plt.subplot(1, 3, 2)
+    plt.subplot(1, 4, 2)
     plt.imshow(gt.V_grid.T)
     plt.colorbar()
     plt.title("Ground truth")
-    plt.subplot(1, 3, 3)
+    plt.subplot(1, 4, 3)
     plt.imshow(np.abs(V_grid.T - gt.V_grid.T))
     plt.colorbar()
     plt.title("Absolute difference")
+    plt.subplot(1, 4, 4)
+    plt.imshow(np.max(rewards_grid, axis=2).T)
+    plt.colorbar()
+    plt.title("Rewards")
     plt.show()
