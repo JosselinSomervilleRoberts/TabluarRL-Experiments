@@ -1,11 +1,31 @@
 import os
-from datetime import datetime
 
 import torch
-import numpy as np
 import gym
 
-from ppo import PPO, PPOTrainingParameters, DeepPolicy
+from ppo import PPO, PPOTrainingParameters, DeepPolicy, collect_trajectories_serial
+
+
+################################## set device ##################################
+
+print(
+    "============================================================================================"
+)
+
+
+# set device to cpu or cuda
+device = torch.device("cpu")
+
+if torch.cuda.is_available():
+    device = torch.device("cuda:0")
+    torch.cuda.empty_cache()
+    print("Device set to : " + str(torch.cuda.get_device_name(device)))
+else:
+    print("Device set to : cpu")
+
+print(
+    "============================================================================================"
+)
 
 
 print(
@@ -92,13 +112,16 @@ def policy_factory():
         else env.action_space.n,
         has_continuous_action_space=has_continuous_action_space,
         action_std_init=action_std,
+        device=device,
     )
 
 
 # initialize a PPO agent
 ppo_agent = PPO(
     policy_builder=policy_factory,
+    collect_trajectory_fn=collect_trajectories_serial,
     params=params,
+    device=device,
 )
 
 ppo_agent.train(

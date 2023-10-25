@@ -1,35 +1,15 @@
 ############################### Import libraries ###############################
 
+from abc import abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Optional, Tuple
+
 
 import torch
 import torch.nn as nn
 from torch.distributions import MultivariateNormal
 from torch.distributions import Categorical
-
-
-################################## set device ##################################
-
-print(
-    "============================================================================================"
-)
-
-
-# set device to cpu or cuda
-device = torch.device("cpu")
-
-if torch.cuda.is_available():
-    device = torch.device("cuda:0")
-    torch.cuda.empty_cache()
-    print("Device set to : " + str(torch.cuda.get_device_name(device)))
-else:
-    print("Device set to : cpu")
-
-print(
-    "============================================================================================"
-)
 
 
 ################################## PPO Policy ##################################
@@ -60,14 +40,20 @@ class Policy(nn.Module):
         action_dim: tuple,
         has_continuous_action_space: bool = False,
         action_std_init: Optional[float] = None,
+        device: torch.device = torch.device("cpu"),
     ):
         super(Policy, self).__init__()
+        self.device: torch.device = device
         self.state_dim: tuple = state_dim
         self.action_dim: tuple = action_dim
         self.has_continuous_action_space: bool = has_continuous_action_space
         self.action_std: Optional[float] = action_std_init
         if self.has_continuous_action_space and self.action_std is None:
             raise ValueError("Must set action_std_init with continuous action space")
+        if self.has_continuous_action_space:
+            self.action_var = torch.full(
+                (action_dim,), action_std_init * action_std_init
+            ).to(self.device)
 
     def forward(self):
         raise NotImplementedError
@@ -133,19 +119,34 @@ class Policy(nn.Module):
 
         return action_logprobs, state_values, dist_entropy
 
+    def set_action_std(self, new_action_std: float) -> None:
+        """Sets the standard deviation of the action distribution
+
+        Args:
+            new_action_std (float): The new standard deviation to use
+        """
+        if self.has_continuous_action_space:
+            self.action_var = torch.full(
+                (self.action_dim,), new_action_std * new_action_std
+            ).to(device)
+        else:
+            print("-------------------------------------------------------------------")
+            print("WARNING : Calling Policy::set_action_std() on discrete action space")
+            print("-------------------------------------------------------------------")
+
 
 class DeepPolicy(Policy):
     def __init__(
-        self, state_dim, action_dim, has_continuous_action_space, action_std_init
+        self,
+        state_dim: tuple,
+        action_dim: tuple,
+        has_continuous_action_space: bool = False,
+        action_std_init: Optional[float] = None,
+        device: torch.device = torch.device("cpu"),
     ):
         super(DeepPolicy, self).__init__(
-            state_dim, action_dim, has_continuous_action_space, action_std_init
+            state_dim, action_dim, has_continuous_action_space, action_std_init, device
         )
-
-        if has_continuous_action_space:
-            self.action_var = torch.full(
-                (action_dim,), action_std_init * action_std_init
-            ).to(device)
 
         # actor
         if has_continuous_action_space:
@@ -176,24 +177,10 @@ class DeepPolicy(Policy):
             nn.Linear(64, 1),
         )
 
-    def set_action_std(self, new_action_std):
-        if self.has_continuous_action_space:
-            self.action_var = torch.full(
-                (self.action_dim,), new_action_std * new_action_std
-            ).to(device)
-        else:
-            print(
-                "--------------------------------------------------------------------------------------------"
-            )
-            print(
-                "WARNING : Calling ActorCritic::set_action_std() on discrete action space policy"
-            )
-            print(
-                "--------------------------------------------------------------------------------------------"
-            )
 
-
-def collect_trajectories(env, agent, num_timesteps_required: int) -> int:
+def collect_trajectories_serial(
+    env, agent: "Agent", num_timesteps_required: int
+) -> int:
     state, _ = env.reset()
     current_ep_reward = 0
     current_num_timesteps = 0
@@ -232,7 +219,7 @@ def collect_trajectories(env, agent, num_timesteps_required: int) -> int:
 
 
 @dataclass
-class PPOTrainingParameters:
+class TrainingParameters:
     # ========== Scheduling =========== #
     # Maximum number of timesteps per episode
     max_ep_len: int
@@ -244,6 +231,16 @@ class PPOTrainingParameters:
     update_timestep: int
 
     # =========== Learning =========== #
+    # Learning rate for actor
+    lr_actor: float
+
+    # Learning rate for critic
+    lr_critic: float
+
+
+@dataclass
+class PPOTrainingParameters(TrainingParameters):
+    # =========== Learning =========== #
     # Number of epochs to update the policy for
     K_epochs: int
 
@@ -253,26 +250,68 @@ class PPOTrainingParameters:
     # Epsilon for clipping
     eps_clip: float
 
-    # Learning rate for actor
-    lr_actor: float
-
-    # Learning rate for critic
-    lr_critic: float
-
     # =========== Continuous =========== #
     # Starting std for continuous action distribution (Multivariate Normal)
     action_std_init: Optional[float] = None
 
 
-class PPO:
+class Agent:
     def __init__(
         self,
         policy_builder: Callable[[], Policy],
-        params: PPOTrainingParameters,
+        collect_trajectory_fn: callable,
+        params: TrainingParameters,
+        device: torch.device = torch.device("cpu"),
     ):
-        self.params: PPOTrainingParameters = params
-        self.policy: Policy = policy_builder().to(device)
+        self.device: torch.device = device
+        self.params: TrainingParameters = params
+        self.policy_builder: Callable[[], Policy] = policy_builder
+        self.policy: Policy = policy_builder().to(self.device)
+        self.collect_trajectory_fn: callable = collect_trajectory_fn
         self.buffer = RolloutBuffer()
+
+    def select_action(self, state: torch.Tensor) -> torch.Tensor:
+        """Selects an action to take given a state
+
+        Args:
+            state (torch.Tensor): The state to calculate the action for (Shape: (batch_size, state_dim))
+
+        Returns:
+            action (torch.Tensor): The action to take (Shape: (batch_size, action_dim))
+        """
+
+        with torch.no_grad():
+            state = torch.FloatTensor(state).to(self.device)
+            action, action_logprob, state_val = self.policy_old.act(state)
+
+        self.buffer.states.append(state)
+        self.buffer.actions.append(action)
+        self.buffer.logprobs.append(action_logprob)
+        self.buffer.state_values.append(state_val)
+
+        if self.has_continuous_action_space:
+            return action.detach().cpu().numpy().flatten()
+        else:
+            return action.item()
+
+    @abstractmethod
+    def save(self, checkpoint_path: str) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def load(self, checkpoint_path: str) -> None:
+        raise NotImplementedError
+
+
+class PPO(Agent):
+    def __init__(
+        self,
+        policy_builder: Callable[[], Policy],
+        collect_trajectory_fn: callable,
+        params: PPOTrainingParameters,
+        device: torch.device = torch.device("cpu"),
+    ):
+        super().__init__(policy_builder, collect_trajectory_fn, params, device)
 
         # ============ Continuous ============ #
         self.has_continuous_action_space = self.policy.has_continuous_action_space
@@ -281,20 +320,8 @@ class PPO:
             self.policy.action_std = self.action_std
 
         # Old policy to calculate the ratio
-        self.policy_old = policy_builder().to(device)
+        self.policy_old = policy_builder().to(self.device)
         self.policy_old.load_state_dict(self.policy.state_dict())
-
-        # Training stuff
-        self.optimizer = torch.optim.Adam(
-            [
-                {"params": self.policy.actor.parameters(), "lr": self.params.lr_actor},
-                {
-                    "params": self.policy.critic.parameters(),
-                    "lr": self.params.lr_critic,
-                },
-            ]
-        )
-        self.MseLoss = nn.MSELoss()
 
     def set_action_std(self, new_action_std):
         if self.has_continuous_action_space:
@@ -340,35 +367,6 @@ class PPO:
             "--------------------------------------------------------------------------------------------"
         )
 
-    def select_action(self, state):
-        # state = state[0]
-
-        if self.has_continuous_action_space:
-            with torch.no_grad():
-                # debug(state, visible=True)
-                state = torch.FloatTensor(state).to(device)
-                action, action_logprob, state_val = self.policy_old.act(state)
-
-            self.buffer.states.append(state)
-            self.buffer.actions.append(action)
-            self.buffer.logprobs.append(action_logprob)
-            self.buffer.state_values.append(state_val)
-
-            return action.detach().cpu().numpy().flatten()
-
-        else:
-            with torch.no_grad():
-                # debug(state, visible=True)
-                state = torch.FloatTensor(state).to(device)
-                action, action_logprob, state_val = self.policy_old.act(state)
-
-            self.buffer.states.append(state)
-            self.buffer.actions.append(action)
-            self.buffer.logprobs.append(action_logprob)
-            self.buffer.state_values.append(state_val)
-
-            return action.item()
-
     def update(self):
         # Monte Carlo estimate of returns
         rewards = []
@@ -382,23 +380,29 @@ class PPO:
             rewards.insert(0, discounted_reward)
 
         # Normalizing the rewards
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
+        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
 
         # convert list to tensor
         old_states = (
-            torch.squeeze(torch.stack(self.buffer.states, dim=0)).detach().to(device)
+            torch.squeeze(torch.stack(self.buffer.states, dim=0))
+            .detach()
+            .to(self.device)
         )
         old_actions = (
-            torch.squeeze(torch.stack(self.buffer.actions, dim=0)).detach().to(device)
+            torch.squeeze(torch.stack(self.buffer.actions, dim=0))
+            .detach()
+            .to(self.device)
         )
         old_logprobs = (
-            torch.squeeze(torch.stack(self.buffer.logprobs, dim=0)).detach().to(device)
+            torch.squeeze(torch.stack(self.buffer.logprobs, dim=0))
+            .detach()
+            .to(self.device)
         )
         old_state_values = (
             torch.squeeze(torch.stack(self.buffer.state_values, dim=0))
             .detach()
-            .to(device)
+            .to(self.device)
         )
 
         # calculate advantages
@@ -442,10 +446,10 @@ class PPO:
         # clear buffer
         self.buffer.clear()
 
-    def save(self, checkpoint_path):
+    def save(self, checkpoint_path: str) -> None:
         torch.save(self.policy_old.state_dict(), checkpoint_path)
 
-    def load(self, checkpoint_path):
+    def load(self, checkpoint_path: str) -> None:
         self.policy_old.load_state_dict(
             torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
         )
@@ -462,6 +466,18 @@ class PPO:
         log_f_name: str,
         checkpoint_path: str,
     ):
+        # Training stuff
+        self.optimizer = torch.optim.Adam(
+            [
+                {"params": self.policy.actor.parameters(), "lr": self.params.lr_actor},
+                {
+                    "params": self.policy.critic.parameters(),
+                    "lr": self.params.lr_critic,
+                },
+            ]
+        )
+        self.MseLoss = nn.MSELoss()
+
         # track total training time
         start_time = datetime.now().replace(microsecond=0)
         print("Started training at (GMT) : ", start_time)
@@ -488,7 +504,7 @@ class PPO:
         while time_step <= self.params.max_training_timesteps:
             # collect trajectories
             # print("Collecting trajectories...")
-            num_timesteps, num_episodes, total_reward = collect_trajectories(
+            num_timesteps, num_episodes, total_reward = self.collect_trajectory_fn(
                 env, self, self.params.update_timestep
             )
             time_step += num_timesteps
