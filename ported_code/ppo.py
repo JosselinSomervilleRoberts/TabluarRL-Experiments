@@ -1,5 +1,8 @@
 ############################### Import libraries ###############################
 
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Callable, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -50,16 +53,96 @@ class RolloutBuffer:
         del self.is_terminals[:]
 
 
-class ActorCritic(nn.Module):
+class Policy(nn.Module):
+    def __init__(
+        self,
+        state_dim: tuple,
+        action_dim: tuple,
+        has_continuous_action_space: bool = False,
+        action_std_init: Optional[float] = None,
+    ):
+        super(Policy, self).__init__()
+        self.state_dim: tuple = state_dim
+        self.action_dim: tuple = action_dim
+        self.has_continuous_action_space: bool = has_continuous_action_space
+        self.action_std: Optional[float] = action_std_init
+        if self.has_continuous_action_space and self.action_std is None:
+            raise ValueError("Must set action_std_init with continuous action space")
+
+    def forward(self):
+        raise NotImplementedError
+
+    def act(
+        self, state: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Calculates the action to take given a state
+
+        Args:
+            state (torch.Tensor): The state to calculate the action for (Shape: (batch_size, state_dim))
+
+        Returns:
+            action (torch.Tensor): The action to take (Shape: (batch_size, action_dim))
+            action_logprob (torch.Tensor): The log probability of the action (Shape: (batch_size, 1))
+            state_val (torch.Tensor): The value of the state (Shape: (batch_size, 1))
+        """
+        if self.has_continuous_action_space:
+            action_mean = self.actor(state)
+            cov_mat = torch.diag(self.action_var).unsqueeze(dim=0)
+            dist = MultivariateNormal(action_mean, cov_mat)
+        else:
+            action_probs = self.actor(state)
+            dist = Categorical(action_probs)
+
+        action = dist.sample()
+        action_logprob = dist.log_prob(action)
+        state_val = self.critic(state)
+
+        return action.detach(), action_logprob.detach(), state_val.detach()
+
+    def evaluate(
+        self, state: torch.Tensor, action: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Calculates the log probability of an action given a state and the value of the state
+
+        Args:
+            state (torch.Tensor): The state to calculate the action for (Shape: (batch_size, state_dim))
+            action (torch.Tensor): The action to evaluate (Shape: (batch_size, action_dim))
+
+        Returns:
+            action_logprobs (torch.Tensor): The log probability of the action (Shape: (batch_size, 1))
+            state_values (torch.Tensor): The value of the state (Shape: (batch_size, 1))
+            dist_entropy (torch.Tensor): The entropy of the distribution (Shape: (batch_size, 1))
+        """
+        if self.has_continuous_action_space:
+            action_mean = self.actor(state)
+            action_var = self.action_var.expand_as(action_mean)
+            cov_mat = torch.diag_embed(action_var).to(device)
+            dist = MultivariateNormal(action_mean, cov_mat)
+
+            # for single action continuous environments
+            if self.action_dim == 1:
+                action = action.reshape(-1, self.action_dim)
+
+        else:
+            action_probs = self.actor(state)
+            dist = Categorical(action_probs)
+
+        action_logprobs = dist.log_prob(action)
+        dist_entropy = dist.entropy()
+        state_values = self.critic(state)
+
+        return action_logprobs, state_values, dist_entropy
+
+
+class DeepPolicy(Policy):
     def __init__(
         self, state_dim, action_dim, has_continuous_action_space, action_std_init
     ):
-        super(ActorCritic, self).__init__()
-
-        self.has_continuous_action_space = has_continuous_action_space
+        super(DeepPolicy, self).__init__(
+            state_dim, action_dim, has_continuous_action_space, action_std_init
+        )
 
         if has_continuous_action_space:
-            self.action_dim = action_dim
             self.action_var = torch.full(
                 (action_dim,), action_std_init * action_std_init
             ).to(device)
@@ -109,85 +192,108 @@ class ActorCritic(nn.Module):
                 "--------------------------------------------------------------------------------------------"
             )
 
-    def forward(self):
-        raise NotImplementedError
 
-    def act(self, state):
-        if self.has_continuous_action_space:
-            action_mean = self.actor(state)
-            cov_mat = torch.diag(self.action_var).unsqueeze(dim=0)
-            dist = MultivariateNormal(action_mean, cov_mat)
-        else:
-            action_probs = self.actor(state)
-            dist = Categorical(action_probs)
+def collect_trajectories(env, agent, num_timesteps_required: int) -> int:
+    state, _ = env.reset()
+    current_ep_reward = 0
+    current_num_timesteps = 0
 
-        action = dist.sample()
-        action_logprob = dist.log_prob(action)
-        state_val = self.critic(state)
+    # Infos collected
+    num_episodes: int = 0
+    total_reward: float = 0.0
+    num_timesteps: int = 0
 
-        return action.detach(), action_logprob.detach(), state_val.detach()
+    while True:
+        action = agent.select_action(state)
+        state, reward, done, _, _ = env.step(action)
+        agent.buffer.rewards.append(reward)
+        agent.buffer.is_terminals.append(done)
+        num_timesteps += 1
+        current_num_timesteps += 1
+        current_ep_reward += reward
 
-    def evaluate(self, state, action):
-        if self.has_continuous_action_space:
-            action_mean = self.actor(state)
-            action_var = self.action_var.expand_as(action_mean)
-            cov_mat = torch.diag_embed(action_var).to(device)
-            dist = MultivariateNormal(action_mean, cov_mat)
+        if done or current_num_timesteps >= agent.params.max_ep_len:
+            num_episodes += 1
+            total_reward += current_ep_reward
+            # print(
+            #     "  - Episode finished after {} timesteps".format(current_num_timesteps)
+            # )
+            if num_timesteps >= num_timesteps_required:
+                break
+            state, _ = env.reset()
+            current_num_timesteps = 0
+            current_ep_reward = 0
+    # print(
+    #     "  -> Collected {} episodes over {} timesteps (Avg reward: {})".format(
+    #         num_episodes, num_timesteps, total_reward / num_episodes
+    #     )
+    # )
+    return num_timesteps, num_episodes, total_reward
 
-            # for single action continuous environments
-            if self.action_dim == 1:
-                action = action.reshape(-1, self.action_dim)
 
-        else:
-            action_probs = self.actor(state)
-            dist = Categorical(action_probs)
+@dataclass
+class PPOTrainingParameters:
+    # ========== Scheduling =========== #
+    # Maximum number of timesteps per episode
+    max_ep_len: int
 
-        action_logprobs = dist.log_prob(action)
-        dist_entropy = dist.entropy()
-        state_values = self.critic(state)
+    # Maximum number of timesteps in the whole training process
+    max_training_timesteps: int
 
-        return action_logprobs, state_values, dist_entropy
+    # Number of timesteps to wait before updating the policy
+    update_timestep: int
+
+    # =========== Learning =========== #
+    # Number of epochs to update the policy for
+    K_epochs: int
+
+    # Discount factor
+    gamma: float
+
+    # Epsilon for clipping
+    eps_clip: float
+
+    # Learning rate for actor
+    lr_actor: float
+
+    # Learning rate for critic
+    lr_critic: float
+
+    # =========== Continuous =========== #
+    # Starting std for continuous action distribution (Multivariate Normal)
+    action_std_init: Optional[float] = None
 
 
 class PPO:
     def __init__(
         self,
-        state_dim,
-        action_dim,
-        lr_actor,
-        lr_critic,
-        gamma,
-        K_epochs,
-        eps_clip,
-        has_continuous_action_space,
-        action_std_init=0.6,
+        policy_builder: Callable[[], Policy],
+        params: PPOTrainingParameters,
     ):
-        self.has_continuous_action_space = has_continuous_action_space
-
-        if has_continuous_action_space:
-            self.action_std = action_std_init
-
-        self.gamma = gamma
-        self.eps_clip = eps_clip
-        self.K_epochs = K_epochs
-
+        self.params: PPOTrainingParameters = params
+        self.policy: Policy = policy_builder().to(device)
         self.buffer = RolloutBuffer()
 
-        self.policy = ActorCritic(
-            state_dim, action_dim, has_continuous_action_space, action_std_init
-        ).to(device)
-        self.optimizer = torch.optim.Adam(
-            [
-                {"params": self.policy.actor.parameters(), "lr": lr_actor},
-                {"params": self.policy.critic.parameters(), "lr": lr_critic},
-            ]
-        )
+        # ============ Continuous ============ #
+        self.has_continuous_action_space = self.policy.has_continuous_action_space
+        if self.has_continuous_action_space:
+            self.action_std = self.params.action_std_init
+            self.policy.action_std = self.action_std
 
-        self.policy_old = ActorCritic(
-            state_dim, action_dim, has_continuous_action_space, action_std_init
-        ).to(device)
+        # Old policy to calculate the ratio
+        self.policy_old = policy_builder().to(device)
         self.policy_old.load_state_dict(self.policy.state_dict())
 
+        # Training stuff
+        self.optimizer = torch.optim.Adam(
+            [
+                {"params": self.policy.actor.parameters(), "lr": self.params.lr_actor},
+                {
+                    "params": self.policy.critic.parameters(),
+                    "lr": self.params.lr_critic,
+                },
+            ]
+        )
         self.MseLoss = nn.MSELoss()
 
     def set_action_std(self, new_action_std):
@@ -272,7 +378,7 @@ class PPO:
         ):
             if is_terminal:
                 discounted_reward = 0
-            discounted_reward = reward + (self.gamma * discounted_reward)
+            discounted_reward = reward + (self.params.gamma * discounted_reward)
             rewards.insert(0, discounted_reward)
 
         # Normalizing the rewards
@@ -299,7 +405,7 @@ class PPO:
         advantages = rewards.detach() - old_state_values.detach()
 
         # Optimize policy for K epochs
-        for _ in range(self.K_epochs):
+        for _ in range(self.params.K_epochs):
             # Evaluating old actions and values
             logprobs, state_values, dist_entropy = self.policy.evaluate(
                 old_states, old_actions
@@ -314,7 +420,8 @@ class PPO:
             # Finding Surrogate Loss
             surr1 = ratios * advantages
             surr2 = (
-                torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+                torch.clamp(ratios, 1 - self.params.eps_clip, 1 + self.params.eps_clip)
+                * advantages
             )
 
             # final loss of clipped objective PPO
@@ -344,4 +451,137 @@ class PPO:
         )
         self.policy.load_state_dict(
             torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
+        )
+
+    def train(
+        self,
+        env,
+        print_freq: int,
+        log_freq: int,
+        save_model_freq: int,
+        log_f_name: str,
+        checkpoint_path: str,
+    ):
+        # track total training time
+        start_time = datetime.now().replace(microsecond=0)
+        print("Started training at (GMT) : ", start_time)
+
+        print(
+            "============================================================================================"
+        )
+
+        # logging file
+        log_f = open(log_f_name, "w+")
+        log_f.write("episode,timestep,reward\n")
+
+        # printing and logging variables
+        print_running_reward = 0
+        print_running_episodes = 0
+
+        log_running_reward = 0
+        log_running_episodes = 0
+
+        time_step = 0
+        i_episode = 0
+
+        # training loop
+        while time_step <= self.params.max_training_timesteps:
+            # collect trajectories
+            # print("Collecting trajectories...")
+            num_timesteps, num_episodes, total_reward = collect_trajectories(
+                env, self, self.params.update_timestep
+            )
+            time_step += num_timesteps
+            print_running_reward += total_reward
+            print_running_episodes += num_episodes
+            log_running_reward += total_reward
+            log_running_episodes += num_episodes
+            i_episode += num_episodes
+
+            # update PPO agent
+            self.update()
+
+            # state, _ = env.reset()
+            # current_ep_reward = 0
+
+            # for t in range(1, max_ep_len + 1):
+            #     # select action with policy
+            #     action = ppo_agent.select_action(state)
+            #     state, reward, done, _, _ = env.step(action)
+
+            #     # saving reward and is_terminals
+            #     ppo_agent.buffer.rewards.append(reward)
+            #     ppo_agent.buffer.is_terminals.append(done)
+
+            #     time_step += 1
+            #     current_ep_reward += reward
+
+            #     # update PPO agent
+            #     if time_step % update_timestep == 0:
+            #         ppo_agent.update()
+
+            #     # if continuous action space; then decay action std of ouput action distribution
+            #     if has_continuous_action_space and time_step % action_std_decay_freq == 0:
+            #         ppo_agent.decay_action_std(action_std_decay_rate, min_action_std)
+
+            # log in logging file
+            if time_step % log_freq == 0:
+                # log average reward till last episode
+                log_avg_reward = log_running_reward / log_running_episodes
+                log_avg_reward = round(log_avg_reward, 4)
+
+                log_f.write("{},{},{}\n".format(i_episode, time_step, log_avg_reward))
+                log_f.flush()
+
+                log_running_reward = 0
+                log_running_episodes = 0
+
+            # printing average reward
+            if time_step % print_freq == 0:
+                # print average reward till last episode
+                print_avg_reward = print_running_reward / print_running_episodes
+                print_avg_reward = round(print_avg_reward, 2)
+
+                print(
+                    "Episode : {} \t\t Timestep : {} \t\t Average Reward : {}".format(
+                        i_episode, time_step, print_avg_reward
+                    )
+                )
+
+                print_running_reward = 0
+                print_running_episodes = 0
+
+            # save model weights
+            if time_step % save_model_freq == 0:
+                print(
+                    "--------------------------------------------------------------------------------------------"
+                )
+                print("saving model at : " + checkpoint_path)
+                self.save(checkpoint_path)
+                print("model saved")
+                print(
+                    "Elapsed Time  : ",
+                    datetime.now().replace(microsecond=0) - start_time,
+                )
+                print(
+                    "--------------------------------------------------------------------------------------------"
+                )
+
+                # # break; if the episode is over
+                # if done:
+                #     break
+
+        log_f.close()
+        env.close()
+
+        # print total training time
+        print(
+            "============================================================================================"
+        )
+        end_time = datetime.now().replace(microsecond=0)
+        print("Started training at (GMT) : ", start_time)
+        print("Finished training at (GMT) : ", end_time)
+        print("Total training time  : ", end_time - start_time)
+        print(
+            "============================================================================================"
         )
