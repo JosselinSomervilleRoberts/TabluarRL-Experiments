@@ -16,21 +16,87 @@ from torch.distributions import Categorical
 
 
 class RolloutBuffer:
-    def __init__(self):
-        self.actions = []
-        self.states = []
-        self.logprobs = []
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        max_buffer_size: int = 1000000,
+        device: torch.device = torch.device("cpu"),
+    ):
+        self.actions = torch.zeros(
+            (max_buffer_size, action_dim), dtype=torch.float32
+        ).to(device)
+        self.states = torch.zeros((max_buffer_size, state_dim), dtype=torch.float32).to(
+            device
+        )
+        self.logprobs = torch.zeros((max_buffer_size, 1), dtype=torch.float32).to(
+            device
+        )
         self.rewards = []
-        self.state_values = []
+        self.state_values = torch.zeros((max_buffer_size, 1), dtype=torch.float32).to(
+            device
+        )
         self.is_terminals = []
 
-    def clear(self):
-        del self.actions[:]
-        del self.states[:]
-        del self.logprobs[:]
-        del self.rewards[:]
-        del self.state_values[:]
-        del self.is_terminals[:]
+        self.num_entries: int = 0
+        self.index: int = 0
+        self.max_buffer_size: int = max_buffer_size
+
+    def add(
+        self,
+        state: torch.Tensor,
+        action: torch.Tensor,
+        logprob: torch.Tensor,
+        reward: torch.Tensor,
+        state_value: torch.Tensor,
+        is_terminal: torch.Tensor,
+    ) -> None:
+        """Adds a transition to the buffer
+
+        Args:
+            state (torch.Tensor): The state to add (Shape: (state_dim,))
+            action (torch.Tensor): The action to add (Shape: (action_dim,))
+            logprob (torch.Tensor): The log probability of the action (Shape: (1,))
+            reward (torch.Tensor): The reward for the transition (Shape: (1,))
+            state_value (torch.Tensor): The value of the state (Shape: (1,))
+            is_terminal (torch.Tensor): Whether the state is terminal (Shape: (1,))
+        """
+        self.actions[self.index] = action
+        self.states[self.index] = state
+        self.logprobs[self.index] = logprob
+        self.rewards.append(reward)
+        self.state_values[self.index] = state_value
+        self.is_terminals.append(is_terminal)
+        self.index = (self.index + 1) % self.max_buffer_size
+        self.num_entries = min(self.num_entries + 1, self.max_buffer_size)
+        # print(self.num_entries)
+
+    def sample(self, batch_size: int) -> Tuple[torch.Tensor, ...]:
+        """Samples a batch from the buffer
+
+        Args:
+            batch_size (int): The size of the batch to sample
+
+        Returns:
+            Tuple[torch.Tensor, ...]: The batch of transitions
+        """
+        # Indices go from num_entries - batch_size to num_entries
+        # indices = torch.randint(0, self.num_entries, (batch_size,))
+        return (
+            self.states[: self.num_entries].detach().squeeze(),
+            self.actions[: self.num_entries].detach().squeeze(),
+            self.logprobs[: self.num_entries].detach().squeeze(),
+            self.rewards[: self.num_entries],
+            self.state_values[: self.num_entries].detach().squeeze(),
+            self.is_terminals[: self.num_entries],
+        )
+
+    def clear(self) -> None:
+        """Clears the buffer"""
+        self.num_entries = 0
+        self.index = 0
+        self.rewards = []
+        self.is_terminals = []
 
 
 class Policy(nn.Module):
@@ -102,7 +168,7 @@ class Policy(nn.Module):
         if self.has_continuous_action_space:
             action_mean = self.actor(state)
             action_var = self.action_var.expand_as(action_mean)
-            cov_mat = torch.diag_embed(action_var).to(device)
+            cov_mat = torch.diag_embed(action_var).to(self.device)
             dist = MultivariateNormal(action_mean, cov_mat)
 
             # for single action continuous environments
@@ -128,7 +194,7 @@ class Policy(nn.Module):
         if self.has_continuous_action_space:
             self.action_var = torch.full(
                 (self.action_dim,), new_action_std * new_action_std
-            ).to(device)
+            ).to(self.device)
         else:
             print("-------------------------------------------------------------------")
             print("WARNING : Calling Policy::set_action_std() on discrete action space")
@@ -191,10 +257,25 @@ def collect_trajectories_serial(
     num_timesteps: int = 0
 
     while True:
-        action = agent.select_action(state)
+        (
+            action,
+            action_stored,
+            past_state,
+            action_logprob,
+            state_val,
+        ) = agent.select_action(state)
         state, reward, done, _, _ = env.step(action)
-        agent.buffer.rewards.append(reward)
-        agent.buffer.is_terminals.append(done)
+
+        # store the transition in buffer
+        agent.buffer.add(
+            state=past_state,
+            action=action_stored,
+            logprob=action_logprob,
+            reward=reward,
+            state_value=state_val,
+            is_terminal=done,
+        )
+
         num_timesteps += 1
         current_num_timesteps += 1
         current_ep_reward += reward
@@ -268,7 +349,12 @@ class Agent:
         self.policy_builder: Callable[[], Policy] = policy_builder
         self.policy: Policy = policy_builder().to(self.device)
         self.collect_trajectory_fn: callable = collect_trajectory_fn
-        self.buffer = RolloutBuffer()
+
+        self.buffer = RolloutBuffer(
+            state_dim=self.policy.state_dim,
+            action_dim=1,  # ,self.policy.action_dim,
+            device=self.device,
+        )
 
     def select_action(self, state: torch.Tensor) -> torch.Tensor:
         """Selects an action to take given a state
@@ -278,21 +364,22 @@ class Agent:
 
         Returns:
             action (torch.Tensor): The action to take (Shape: (batch_size, action_dim))
+            action_tensor (torch.Tensor): The action to store (Shape: (batch_size, action_dim))
+            past_state (torch.Tensor): The state to calculate the action for (Shape: (batch_size, state_dim))
+            action_logprob (torch.Tensor): The log probability of the action (Shape: (batch_size, 1))
+            state_val (torch.Tensor): The value of the state (Shape: (batch_size, 1))
         """
 
         with torch.no_grad():
             state = torch.FloatTensor(state).to(self.device)
-            action, action_logprob, state_val = self.policy_old.act(state)
-
-        self.buffer.states.append(state)
-        self.buffer.actions.append(action)
-        self.buffer.logprobs.append(action_logprob)
-        self.buffer.state_values.append(state_val)
+            action_tensor, action_logprob, state_val = self.policy_old.act(state)
 
         if self.has_continuous_action_space:
-            return action.detach().cpu().numpy().flatten()
+            action = action_tensor.detach().cpu().numpy().flatten()
         else:
-            return action.item()
+            action = action_tensor.item()
+
+        return action, action_tensor, state, action_logprob, state_val
 
     @abstractmethod
     def save(self, checkpoint_path: str) -> None:
@@ -368,6 +455,18 @@ class PPO(Agent):
         )
 
     def update(self):
+        from toolbox.printing import debug
+
+        (
+            old_states,
+            old_actions,
+            old_logprobs,
+            _,
+            old_state_values,
+            _,
+        ) = self.buffer.sample(self.buffer.num_entries)
+        debug(self.buffer.num_entries)
+
         # Monte Carlo estimate of returns
         rewards = []
         discounted_reward = 0
@@ -383,27 +482,11 @@ class PPO(Agent):
         rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
 
-        # convert list to tensor
-        old_states = (
-            torch.squeeze(torch.stack(self.buffer.states, dim=0))
-            .detach()
-            .to(self.device)
-        )
-        old_actions = (
-            torch.squeeze(torch.stack(self.buffer.actions, dim=0))
-            .detach()
-            .to(self.device)
-        )
-        old_logprobs = (
-            torch.squeeze(torch.stack(self.buffer.logprobs, dim=0))
-            .detach()
-            .to(self.device)
-        )
-        old_state_values = (
-            torch.squeeze(torch.stack(self.buffer.state_values, dim=0))
-            .detach()
-            .to(self.device)
-        )
+        debug(old_actions)
+        debug(old_logprobs)
+        debug(old_state_values)
+        debug(old_states)
+        debug(rewards)
 
         # calculate advantages
         advantages = rewards.detach() - old_state_values.detach()
@@ -516,29 +599,6 @@ class PPO(Agent):
 
             # update PPO agent
             self.update()
-
-            # state, _ = env.reset()
-            # current_ep_reward = 0
-
-            # for t in range(1, max_ep_len + 1):
-            #     # select action with policy
-            #     action = ppo_agent.select_action(state)
-            #     state, reward, done, _, _ = env.step(action)
-
-            #     # saving reward and is_terminals
-            #     ppo_agent.buffer.rewards.append(reward)
-            #     ppo_agent.buffer.is_terminals.append(done)
-
-            #     time_step += 1
-            #     current_ep_reward += reward
-
-            #     # update PPO agent
-            #     if time_step % update_timestep == 0:
-            #         ppo_agent.update()
-
-            #     # if continuous action space; then decay action std of ouput action distribution
-            #     if has_continuous_action_space and time_step % action_std_decay_freq == 0:
-            #         ppo_agent.decay_action_std(action_std_decay_rate, min_action_std)
 
             # log in logging file
             if time_step % log_freq == 0:
