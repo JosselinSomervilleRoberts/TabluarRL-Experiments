@@ -223,19 +223,26 @@ class BatchedRolloutBuffer:
         self.episode_indices += 1
 
         # Handle episodes that are done and add them to the linear buffer
-        for i in range(self.batch_size):
-            if is_terminals[i]:
-                # print(f"Terminal {i} at {self.episode_indices[i]}")
-                self.linear_buffer.add_batch(
-                    actions=self.actions[i],
-                    states=self.states[i],
-                    logprobs=self.logprobs[i],
-                    rewards=self.rewards[i],
-                    state_values=self.state_values[i],
-                    is_terminals=self.is_terminals[i],
-                    num_entries=self.episode_indices[i].item(),
-                )
-                self.episode_indices[i] = 0
+        for i in range(self.is_terminals.shape[0]):
+            try:
+                # from toolbox.printing import debug
+
+                # debug(is_terminals)
+                # debug(self.episode_indices)
+                if is_terminals[i]:
+                    # print(f"Terminal {i} at {self.episode_indices[i]}")
+                    self.linear_buffer.add_batch(
+                        actions=self.actions[i],
+                        states=self.states[i],
+                        logprobs=self.logprobs[i],
+                        rewards=self.rewards[i],
+                        state_values=self.state_values[i],
+                        is_terminals=self.is_terminals[i],
+                        num_entries=self.episode_indices[i].item(),
+                    )
+                    self.episode_indices[i] = 0
+            except:
+                pass
 
     def sample(self, batch_size: int) -> Tuple[torch.Tensor, ...]:
         return self.linear_buffer.sample(batch_size)
@@ -419,6 +426,13 @@ def collect_trajectories_serial(
             state_val,
         ) = agent.select_action(state)
         state, reward, done, _, _ = env.step(action)
+        num_timesteps += 1
+        current_num_timesteps += 1
+        current_ep_reward += reward
+
+        # Stops episodes that are too long
+        if current_num_timesteps >= agent.params.max_ep_len:
+            done = True
 
         # store the transition in buffer
         agent.buffer.batch_add(
@@ -430,11 +444,7 @@ def collect_trajectories_serial(
             is_terminals=torch.tensor([[done]], dtype=bool, device=agent.device),
         )
 
-        num_timesteps += 1
-        current_num_timesteps += 1
-        current_ep_reward += reward
-
-        if done or current_num_timesteps >= agent.params.max_ep_len:
+        if done:
             num_episodes += 1
             total_reward += current_ep_reward
             # print(
