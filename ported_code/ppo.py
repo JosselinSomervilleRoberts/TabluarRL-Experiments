@@ -32,11 +32,13 @@ class RolloutBuffer:
         self.logprobs = torch.zeros((max_buffer_size, 1), dtype=torch.float32).to(
             device
         )
-        self.rewards = []
+        self.rewards = torch.zeros((max_buffer_size, 1), dtype=torch.float32).to(device)
         self.state_values = torch.zeros((max_buffer_size, 1), dtype=torch.float32).to(
             device
         )
-        self.is_terminals = []
+        self.is_terminals = torch.zeros((max_buffer_size, 1), dtype=torch.float32).to(
+            device
+        )
 
         self.num_entries: int = 0
         self.index: int = 0
@@ -64,9 +66,9 @@ class RolloutBuffer:
         self.actions[self.index] = action
         self.states[self.index] = state
         self.logprobs[self.index] = logprob
-        self.rewards.append(reward)
+        self.rewards[self.index] = reward
         self.state_values[self.index] = state_value
-        self.is_terminals.append(is_terminal)
+        self.is_terminals[self.index] = is_terminal
         self.index = (self.index + 1) % self.max_buffer_size
         self.num_entries = min(self.num_entries + 1, self.max_buffer_size)
         # print(self.num_entries)
@@ -86,17 +88,15 @@ class RolloutBuffer:
             self.states[: self.num_entries].detach().squeeze(),
             self.actions[: self.num_entries].detach().squeeze(),
             self.logprobs[: self.num_entries].detach().squeeze(),
-            self.rewards[: self.num_entries],
+            self.rewards[: self.num_entries].detach().squeeze(),
             self.state_values[: self.num_entries].detach().squeeze(),
-            self.is_terminals[: self.num_entries],
+            self.is_terminals[: self.num_entries].detach().squeeze(),
         )
 
     def clear(self) -> None:
         """Clears the buffer"""
         self.num_entries = 0
         self.index = 0
-        self.rewards = []
-        self.is_terminals = []
 
 
 class Policy(nn.Module):
@@ -461,18 +461,19 @@ class PPO(Agent):
             old_states,
             old_actions,
             old_logprobs,
-            _,
+            old_rewards,
             old_state_values,
-            _,
+            old_is_terminals,
         ) = self.buffer.sample(self.buffer.num_entries)
         debug(self.buffer.num_entries)
 
         # Monte Carlo estimate of returns
+        # Reverse the tensors
+        old_rewards = old_rewards.flip(0)
+        old_is_terminals = old_is_terminals.flip(0)
         rewards = []
         discounted_reward = 0
-        for reward, is_terminal in zip(
-            reversed(self.buffer.rewards), reversed(self.buffer.is_terminals)
-        ):
+        for reward, is_terminal in zip(old_rewards, old_is_terminals):
             if is_terminal:
                 discounted_reward = 0
             discounted_reward = reward + (self.params.gamma * discounted_reward)
