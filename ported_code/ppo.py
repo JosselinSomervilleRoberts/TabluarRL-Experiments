@@ -20,26 +20,27 @@ class RolloutBuffer:
         self,
         state_dim: int,
         action_dim: int,
-        max_buffer_size: int = 1000000,
+        max_buffer_size: int = 10000,
         device: torch.device = torch.device("cpu"),
     ):
         self.actions = torch.zeros(
-            (max_buffer_size, action_dim), dtype=torch.float32
-        ).to(device)
-        self.states = torch.zeros((max_buffer_size, state_dim), dtype=torch.float32).to(
-            device
+            (max_buffer_size, action_dim), dtype=torch.float32, device=device
         )
-        self.logprobs = torch.zeros((max_buffer_size, 1), dtype=torch.float32).to(
-            device
+        self.states = torch.zeros(
+            (max_buffer_size, state_dim), dtype=torch.float32, device=device
         )
-        self.rewards = torch.zeros((max_buffer_size, 1), dtype=torch.float32).to(device)
-        self.state_values = torch.zeros((max_buffer_size, 1), dtype=torch.float32).to(
-            device
+        self.logprobs = torch.zeros(
+            (max_buffer_size, 1), dtype=torch.float32, device=device
         )
-        self.is_terminals = torch.zeros((max_buffer_size, 1), dtype=torch.float32).to(
-            device
+        self.rewards = torch.zeros(
+            (max_buffer_size, 1), dtype=torch.float32, device=device
         )
-
+        self.state_values = torch.zeros(
+            (max_buffer_size, 1), dtype=torch.float32, device=device
+        )
+        self.is_terminals = torch.zeros(
+            (max_buffer_size, 1), dtype=torch.float32, device=device
+        )
         self.num_entries: int = 0
         self.index: int = 0
         self.max_buffer_size: int = max_buffer_size
@@ -72,13 +73,28 @@ class RolloutBuffer:
         self.index = (self.index + 1) % self.max_buffer_size
         self.num_entries = min(self.num_entries + 1, self.max_buffer_size)
 
-    def add_buffer(self, buffer: "RolloutBuffer") -> None:
+    def add_batch(
+        self,
+        actions: torch.Tensor,
+        states: torch.Tensor,
+        logprobs: torch.Tensor,
+        rewards: torch.Tensor,
+        state_values: torch.Tensor,
+        is_terminals: torch.Tensor,
+        num_entries: int,
+    ):
         """Adds the contents of another buffer to this buffer
 
         Args:
-            buffer (RolloutBuffer): The buffer to add
+            actions (torch.Tensor): The actions to add (Shape: (num_entries, action_dim))
+            states (torch.Tensor): The states to add (Shape: (num_entries, state_dim))
+            logprobs (torch.Tensor): The log probabilities of the actions (Shape: (num_entries, 1))
+            rewards (torch.Tensor): The rewards for the transitions (Shape: (num_entries, 1))
+            state_values (torch.Tensor): The values of the states (Shape: (num_entries, 1))
+            is_terminals (torch.Tensor): Whether the states are terminal (Shape: (num_entries, 1))
         """
-        if buffer.max_buffer_size > self.max_buffer_size:
+        # print(f"Adding {num_entries} entries to buffer")
+        if num_entries > self.max_buffer_size:
             raise ValueError("Buffer too large")
 
         # Split into bulks so that if fits in the buffer (at most 2 bulks):
@@ -86,30 +102,30 @@ class RolloutBuffer:
         # - from 0 to max(0, self.index + buffer.num_entries - self.max_buffer_size)
 
         # First bulk
-        bulk_size = min(buffer.num_entries, self.max_buffer_size - self.index)
-        self.actions[self.index : self.index + bulk_size] = buffer.actions[:bulk_size]
-        self.states[self.index : self.index + bulk_size] = buffer.states[:bulk_size]
-        self.logprobs[self.index : self.index + bulk_size] = buffer.logprobs[:bulk_size]
-        self.rewards[self.index : self.index + bulk_size] = buffer.rewards[:bulk_size]
-        self.state_values[self.index : self.index + bulk_size] = buffer.state_values[
+        bulk_size = min(num_entries, self.max_buffer_size - self.index)
+        self.actions[self.index : self.index + bulk_size] = actions[:bulk_size]
+        self.states[self.index : self.index + bulk_size] = states[:bulk_size]
+        self.logprobs[self.index : self.index + bulk_size] = logprobs[:bulk_size]
+        self.rewards[self.index : self.index + bulk_size] = rewards[:bulk_size]
+        self.state_values[self.index : self.index + bulk_size] = state_values[
             :bulk_size
         ]
-        self.is_terminals[self.index : self.index + bulk_size] = buffer.is_terminals[
+        self.is_terminals[self.index : self.index + bulk_size] = is_terminals[
             :bulk_size
         ]
         self.num_entries = min(self.num_entries + bulk_size, self.max_buffer_size)
         self.index = (self.index + bulk_size) % self.max_buffer_size
 
         # Second bulk
-        if bulk_size == buffer.num_entries:
+        if bulk_size == num_entries:
             return  # Everything has already been added
-        bulk_size = buffer.num_entries - bulk_size
-        self.actions[:bulk_size] = buffer.actions[-bulk_size:]
-        self.states[:bulk_size] = buffer.states[-bulk_size:]
-        self.logprobs[:bulk_size] = buffer.logprobs[-bulk_size:]
-        self.rewards[:bulk_size] = buffer.rewards[-bulk_size:]
-        self.state_values[:bulk_size] = buffer.state_values[-bulk_size:]
-        self.is_terminals[:bulk_size] = buffer.is_terminals[-bulk_size:]
+        bulk_size = num_entries - bulk_size
+        self.actions[:bulk_size] = actions[-bulk_size:]
+        self.states[:bulk_size] = states[-bulk_size:]
+        self.logprobs[:bulk_size] = logprobs[-bulk_size:]
+        self.rewards[:bulk_size] = rewards[-bulk_size:]
+        self.state_values[:bulk_size] = state_values[-bulk_size:]
+        self.is_terminals[:bulk_size] = is_terminals[-bulk_size:]
         self.num_entries = (
             self.max_buffer_size
         )  # If we reached here, it means we looped around
@@ -139,6 +155,94 @@ class RolloutBuffer:
         """Clears the buffer"""
         self.num_entries = 0
         self.index = 0
+
+
+class BatchedRolloutBuffer:
+    """A buffer that stores episodes as batches"""
+
+    def __init__(
+        self,
+        max_ep_len: int,
+        state_dim: int,
+        batch_size: int,
+        action_dim: int,
+        max_buffer_size: int = 1000000,
+        device: torch.device = torch.device("cpu"),
+    ):
+        self.max_ep_len = max_ep_len
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.batch_size = batch_size
+        self.device = device
+
+        self.states = torch.zeros(
+            (batch_size, max_ep_len, state_dim), dtype=torch.float32, device=device
+        )
+        self.actions = torch.zeros(
+            (batch_size, max_ep_len, action_dim), dtype=torch.int64, device=device
+        )
+        self.logprobs = torch.zeros(
+            (batch_size, max_ep_len, 1), dtype=torch.float32, device=device
+        )
+        self.rewards = torch.zeros(
+            (batch_size, max_ep_len, 1), dtype=torch.float32, device=device
+        )
+        self.state_values = torch.zeros(
+            (batch_size, max_ep_len, 1), dtype=torch.float32, device=device
+        )
+        self.is_terminals = torch.zeros(
+            (batch_size, max_ep_len, 1), dtype=bool, device=device
+        )
+        self.episode_indices = torch.zeros(
+            (batch_size,), dtype=torch.int32, device=device
+        )
+
+        self.linear_buffer = RolloutBuffer(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            max_buffer_size=max_buffer_size,
+            device=device,
+        )
+
+    def batch_add(
+        self,
+        states: torch.Tensor,
+        actions: torch.Tensor,
+        logprobs: torch.Tensor,
+        rewards: torch.Tensor,
+        state_values: torch.Tensor,
+        is_terminals: torch.Tensor,
+    ) -> None:
+        # All tensors are of shape (batch_size, state_dim/action_dim/1)
+        self.states[:, self.episode_indices] = states
+        self.actions[:, self.episode_indices] = actions
+        self.logprobs[:, self.episode_indices] = logprobs
+        self.rewards[:, self.episode_indices] = rewards
+        self.state_values[:, self.episode_indices] = state_values
+        self.is_terminals[:, self.episode_indices] = is_terminals
+        self.episode_indices += 1
+
+        # Handle episodes that are done and add them to the linear buffer
+        for i in range(self.batch_size):
+            if is_terminals[i]:
+                # print(f"Terminal {i} at {self.episode_indices[i]}")
+                self.linear_buffer.add_batch(
+                    actions=self.actions[i],
+                    states=self.states[i],
+                    logprobs=self.logprobs[i],
+                    rewards=self.rewards[i],
+                    state_values=self.state_values[i],
+                    is_terminals=self.is_terminals[i],
+                    num_entries=self.episode_indices[i].item(),
+                )
+                self.episode_indices[i] = 0
+
+    def sample(self, batch_size: int) -> Tuple[torch.Tensor, ...]:
+        return self.linear_buffer.sample(batch_size)
+
+    def clear(self) -> None:
+        self.linear_buffer.clear()
+        self.episode_indices[:] = 0
 
 
 class Policy(nn.Module):
@@ -210,7 +314,7 @@ class Policy(nn.Module):
         if self.has_continuous_action_space:
             action_mean = self.actor(state)
             action_var = self.action_var.expand_as(action_mean)
-            cov_mat = torch.diag_embed(action_var).to(self.device)
+            cov_mat = torch.diag_embed(action_var, device=self.device)
             dist = MultivariateNormal(action_mean, cov_mat)
 
             # for single action continuous environments
@@ -235,8 +339,8 @@ class Policy(nn.Module):
         """
         if self.has_continuous_action_space:
             self.action_var = torch.full(
-                (self.action_dim,), new_action_std * new_action_std
-            ).to(self.device)
+                (self.action_dim,), new_action_std * new_action_std, device=self.device
+            )
         else:
             print("-------------------------------------------------------------------")
             print("WARNING : Calling Policy::set_action_std() on discrete action space")
@@ -298,12 +402,13 @@ def collect_trajectories_serial(
     total_reward: float = 0.0
     num_timesteps: int = 0
 
-    episode_buffer = RolloutBuffer(
-        state_dim=agent.policy.state_dim,
-        action_dim=1,  # ,agent.policy.action_dim,
-        max_buffer_size=agent.params.max_ep_len,
-        device=agent.device,
-    )
+    # buffer = BatchedRolloutBuffer(
+    #     max_ep_len=agent.params.max_ep_len,
+    #     batch_size=1,
+    #     state_dim=agent.policy.state_dim,
+    #     action_dim=1,  # ,agent.policy.action_dim,
+    #     device=agent.device,
+    # )
 
     while True:
         (
@@ -316,13 +421,13 @@ def collect_trajectories_serial(
         state, reward, done, _, _ = env.step(action)
 
         # store the transition in buffer
-        episode_buffer.add(
-            state=past_state,
-            action=action_stored,
-            logprob=action_logprob,
-            reward=reward,
-            state_value=state_val,
-            is_terminal=done,
+        agent.buffer.batch_add(
+            states=past_state.unsqueeze(0),
+            actions=action_stored.unsqueeze(0),
+            logprobs=action_logprob.unsqueeze(0),
+            rewards=torch.tensor([[reward]], dtype=torch.float32, device=agent.device),
+            state_values=state_val.unsqueeze(0),
+            is_terminals=torch.tensor([[done]], dtype=bool, device=agent.device),
         )
 
         num_timesteps += 1
@@ -330,8 +435,6 @@ def collect_trajectories_serial(
         current_ep_reward += reward
 
         if done or current_num_timesteps >= agent.params.max_ep_len:
-            agent.buffer.add_buffer(episode_buffer)
-            episode_buffer.clear()
             num_episodes += 1
             total_reward += current_ep_reward
             # print(
@@ -401,7 +504,9 @@ class Agent:
         self.policy: Policy = policy_builder().to(self.device)
         self.collect_trajectory_fn: callable = collect_trajectory_fn
 
-        self.buffer = RolloutBuffer(
+        self.buffer = BatchedRolloutBuffer(
+            max_ep_len=400,
+            batch_size=1,
             state_dim=self.policy.state_dim,
             action_dim=1,  # ,self.policy.action_dim,
             device=self.device,
@@ -515,8 +620,10 @@ class PPO(Agent):
             old_rewards,
             old_state_values,
             old_is_terminals,
-        ) = self.buffer.sample(self.buffer.num_entries)
-        debug(self.buffer.num_entries)
+        ) = self.buffer.sample(
+            0
+        )  # TODO: Change this to batch_size
+        # debug(self.buffer.linear_buffer.num_entries)
 
         # Monte Carlo estimate of returns
         # Reverse the tensors
@@ -531,14 +638,14 @@ class PPO(Agent):
             rewards.insert(0, discounted_reward)
 
         # Normalizing the rewards
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
+        rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
 
-        debug(old_actions)
-        debug(old_logprobs)
-        debug(old_state_values)
-        debug(old_states)
-        debug(rewards)
+        # debug(old_actions)
+        # debug(old_logprobs)
+        # debug(old_state_values)
+        # debug(old_states)
+        # debug(rewards)
 
         # calculate advantages
         advantages = rewards.detach() - old_state_values.detach()
