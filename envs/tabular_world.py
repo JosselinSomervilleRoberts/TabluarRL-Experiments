@@ -235,29 +235,30 @@ class TabularWorld:
         self.observations[self.force_reset] = 0
         self.force_reset[...] = 0
 
-    def step(self):
+    def step(self, action: Optional[torch.Tensor] = None):
+        if action is not None:
+            self.actions[...] = action
+
         # Apply force_reset where needed
         self.apply_force_reset()
 
         # Assume self.actions has been set, index into transition matrix to get next state and reward
-        # print("Actions", self.actions)
-        # print("Observations", self.observations)
-        # print(self.transition_rewards[self.observations])
-        # print(self.transition_rewards[self.observations, self.actions])
         self.rewards[...] = self.transition_rewards[
             self.observations, self.actions
         ].squeeze()
         self.observations[...] = self.transitions[
             self.observations, self.actions
         ].squeeze()
+
         # self.dones[...] = (
         #     (self.observations == self.transitions.shape[0] - 1).int().squeeze()
         # )
         self.dones = self.rewards > 0
+
         # Reset all the dones
-        # print(self.observations.shape)
-        # print(self.dones.shape)
         self.observations[self.dones == 1] = 0
+
+        return self.observations, self.rewards, self.dones, {}, {}
 
     def reset(self, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Reset the environment for the worlds specified by the mask.
@@ -275,7 +276,10 @@ class TabularWorld:
         self.force_reset[...] = 1
         self.dones[...] = 0
         self.rewards[...] = 0
-        return self.observations
+        return self.observations, {}
+
+    def close(self):
+        pass
 
 
 class TabularWorldWithStateMapper(TabularWorld):

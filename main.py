@@ -3,7 +3,16 @@ import os
 import torch
 import gym
 
-from ppo import PPO, PPOTrainingParameters, DeepPolicy, collect_trajectories_serial
+from ppo import (
+    PPO,
+    PPOTrainingParameters,
+    DeepPolicy,
+    collect_trajectories_serial,
+    TabularPolicy,
+    collect_trajectories_parallel,
+)
+
+from envs.tabular_world import TabularWorld
 
 
 ################################## set device ##################################
@@ -32,11 +41,18 @@ print(
     "============================================================================================"
 )
 
-env_name = "CartPole-v1"
-has_continuous_action_space = False
-action_std = None
+# env_name = "CartPole-v1"
+# has_continuous_action_space = False
+# action_std = None
+# random_seed = 0  # set random seed if required (0 = no random seed)
+# env = gym.make(env_name)
+
+
+env_name = "MiniGrid-BlockedUnlockPickup-v0"
+data_dir = "data/"
+file_name = f"{data_dir}/{env_name}/consolidated.npz"
 random_seed = 0  # set random seed if required (0 = no random seed)
-env = gym.make(env_name)
+env = TabularWorld(file_name, num_worlds=4096, device=device)
 
 print("training environment name : " + env_name)
 
@@ -92,26 +108,47 @@ print("save checkpoint path : " + checkpoint_path)
 #####################################################
 
 
+# params = PPOTrainingParameters(
+#     max_training_timesteps=int(1e5),
+#     max_ep_len=400,
+#     update_timestep=1600,
+#     K_epochs=40,
+#     eps_clip=0.2,
+#     gamma=0.99,
+#     lr_actor=0.0003,
+#     lr_critic=0.001,
+# )
+
+
+# def policy_factory():
+#     return DeepPolicy(
+#         state_dim=env.observation_space.shape[0],
+#         action_dim=env.action_space.shape[0]
+#         if has_continuous_action_space
+#         else env.action_space.n,
+#         has_continuous_action_space=has_continuous_action_space,
+#         action_std_init=action_std,
+#         device=device,
+#     )
+
+
 params = PPOTrainingParameters(
-    max_training_timesteps=int(1e5),
-    max_ep_len=400,
-    update_timestep=1600,
+    max_training_timesteps=int(1e8),
+    max_ep_len=80,
+    update_timestep=env.num_worlds * 75,
     K_epochs=40,
     eps_clip=0.2,
-    gamma=0.99,
-    lr_actor=0.0003,
-    lr_critic=0.001,
+    gamma=0.97,
+    lr_actor=0.003,
+    lr_critic=0.01,
+    update_batch_size=4096 * 8,
 )
 
 
 def policy_factory():
-    return DeepPolicy(
-        state_dim=env.observation_space.shape[0],
-        action_dim=env.action_space.shape[0]
-        if has_continuous_action_space
-        else env.action_space.n,
-        has_continuous_action_space=has_continuous_action_space,
-        action_std_init=action_std,
+    return TabularPolicy(
+        num_states=env.num_states,
+        num_actions=env.num_actions,
         device=device,
     )
 
@@ -119,7 +156,7 @@ def policy_factory():
 # initialize a PPO agent
 ppo_agent = PPO(
     policy_builder=policy_factory,
-    collect_trajectory_fn=collect_trajectories_serial,
+    collect_trajectory_fn=collect_trajectories_parallel,
     params=params,
     device=device,
 )
