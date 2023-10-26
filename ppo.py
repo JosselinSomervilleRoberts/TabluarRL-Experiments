@@ -43,6 +43,9 @@ class RolloutBuffer:
         self.is_terminals = torch.zeros(
             (max_buffer_size, 1), dtype=torch.float32, device=device
         )
+        self.rewards_to_go = torch.zeros(
+            (max_buffer_size, 1), dtype=torch.float32, device=device
+        )
         self.num_entries: int = 0
         self.index: int = 0
         self.max_buffer_size: int = max_buffer_size
@@ -75,6 +78,8 @@ class RolloutBuffer:
         self.index = (self.index + 1) % self.max_buffer_size
         self.num_entries = min(self.num_entries + 1, self.max_buffer_size)
 
+        # TODO: Compute reward to go if the state is terminal
+
     def add_batch(
         self,
         actions: torch.Tensor,
@@ -83,6 +88,7 @@ class RolloutBuffer:
         rewards: torch.Tensor,
         state_values: torch.Tensor,
         is_terminals: torch.Tensor,
+        rewards_to_go: torch.Tensor,
         num_entries: int,
     ):
         """Adds the contents of another buffer to this buffer
@@ -94,6 +100,8 @@ class RolloutBuffer:
             rewards (torch.Tensor): The rewards for the transitions (Shape: (num_entries, 1))
             state_values (torch.Tensor): The values of the states (Shape: (num_entries, 1))
             is_terminals (torch.Tensor): Whether the states are terminal (Shape: (num_entries, 1))
+            rewards_to_go (torch.Tensor): The rewards to go for the transitions (Shape: (num_entries, 1))
+            num_entries (int): The number of entries to add
         """
         # print(f"Adding {num_entries} entries to buffer")
         if num_entries > self.max_buffer_size:
@@ -112,7 +120,12 @@ class RolloutBuffer:
         self.state_values[self.index : self.index + bulk_size] = state_values[
             :bulk_size
         ]
+        # debug(is_terminals)
         self.is_terminals[self.index : self.index + bulk_size] = is_terminals[
+            :bulk_size
+        ]
+        # debug(rewards_to_go)
+        self.rewards_to_go[self.index : self.index + bulk_size] = rewards_to_go[
             :bulk_size
         ]
         self.num_entries = min(self.num_entries + bulk_size, self.max_buffer_size)
@@ -128,6 +141,7 @@ class RolloutBuffer:
         self.rewards[:bulk_size] = rewards[-bulk_size:]
         self.state_values[:bulk_size] = state_values[-bulk_size:]
         self.is_terminals[:bulk_size] = is_terminals[-bulk_size:]
+        self.rewards_to_go[:bulk_size] = rewards_to_go[-bulk_size:]
         self.num_entries = (
             self.max_buffer_size
         )  # If we reached here, it means we looped around
@@ -143,7 +157,18 @@ class RolloutBuffer:
             Tuple[torch.Tensor, ...]: The batch of transitions
         """
         # Indices go from num_entries - batch_size to num_entries
-        indices = torch.randint(0, self.num_entries, (batch_size,))
+        # weights = 0.01 + self.rewards_to_go[: self.num_entries].reshape(-1)
+        # debug(weights)
+        # indices = torch.multinomial(weights, batch_size)
+        indices = torch.where(self.rewards_to_go > 0)[0]
+        if indices.shape[0] < 100:
+            indices = torch.randint(0, self.num_entries, (batch_size,))
+        debug(indices)
+        debug(self.rewards_to_go[indices])
+        debug(
+            torch.sum(self.rewards_to_go[indices].detach().squeeze()) / indices.shape[0]
+        )
+        # indices = torch.randint(0, self.num_entries, (batch_size,))
         return (
             self.states[indices].detach().squeeze(),
             self.actions[indices].detach().squeeze(),
@@ -151,6 +176,7 @@ class RolloutBuffer:
             self.rewards[indices].detach().squeeze(),
             self.state_values[indices].detach().squeeze(),
             self.is_terminals[indices].detach().squeeze(),
+            self.rewards_to_go[indices].detach().squeeze(),
         )
 
     def clear(self) -> None:
@@ -232,21 +258,58 @@ class BatchedRolloutBuffer:
         self.episode_indices += 1
 
         # Handle episodes that are done and add them to the linear buffer
-        for i in range(self.is_terminals.shape[0]):
-            try:
-                if is_terminals[i]:
-                    self.linear_buffer.add_batch(
-                        actions=self.actions[i],
-                        states=self.states[i],
-                        logprobs=self.logprobs[i],
-                        rewards=self.rewards[i],
-                        state_values=self.state_values[i],
-                        is_terminals=self.is_terminals[i],
-                        num_entries=self.episode_indices[i].item(),
-                    )
-                    self.episode_indices[i] = 0
-            except:
-                pass
+        num_dones: int = torch.sum(is_terminals).item()
+        if num_dones > 0:
+            # debug(self.episode_indices)
+            # debug(is_terminals)
+            # debug(self.episode_indices[is_terminals])
+            horizon: int = torch.max(self.episode_indices[is_terminals]).item()
+            rtg = torch.zeros(
+                (num_dones, horizon), dtype=torch.float32, device=self.device
+            )
+            discounted_reward: torch.Tensor = torch.zeros(
+                (num_dones,), device=self.device
+            )
+
+            masked_is_terminals = self.is_terminals[
+                is_terminals
+            ]  # Shape: (num_dones, horizon, 1)
+            masked_rewards = self.rewards[
+                is_terminals
+            ]  # Shape: (num_dones, horizon, 1)
+            # debug(masked_rewards)
+            for i in range(horizon):
+                # debug(i)
+                index = -i - 1
+                is_index_terminal = masked_is_terminals[:, index].squeeze(
+                    -1
+                )  # Shape: (num_dones, 1)
+                # debug(is_index_terminal)
+                # debug(discounted_reward)
+                discounted_reward[is_index_terminal] = 0
+                # debug(discounted_reward)
+                # debug(masked_rewards[:, index])
+                discounted_reward = masked_rewards[:, index].squeeze(-1) + (
+                    0.95 * discounted_reward
+                )
+                # debug(rtg[:, index])
+                # debug(discounted_reward)
+                rtg[:, index] = discounted_reward
+
+            idx_is_terminals = torch.where(is_terminals)[0]  # Shape: (num_dones,)
+            for i, idx in enumerate(idx_is_terminals):
+                assert is_terminals[idx]
+                self.linear_buffer.add_batch(
+                    actions=self.actions[idx],
+                    states=self.states[idx],
+                    logprobs=self.logprobs[idx],
+                    rewards=self.rewards[idx],
+                    state_values=self.state_values[idx],
+                    is_terminals=self.is_terminals[idx],
+                    rewards_to_go=rtg[i].unsqueeze(-1),
+                    num_entries=self.episode_indices[idx].item(),
+                )
+                self.episode_indices[idx] = 0
 
     def sample(self, batch_size: int) -> Tuple[torch.Tensor, ...]:
         return self.linear_buffer.sample(batch_size)
@@ -724,21 +787,22 @@ class PPO(Agent):
             old_rewards,
             old_state_values,
             old_is_terminals,
+            rewards,
         ) = self.buffer.sample(self.params.update_batch_size)
 
-        # Monte Carlo estimate of returns
-        # Reverse the tensors
-        old_rewards = old_rewards.flip(0)
-        old_is_terminals = old_is_terminals.flip(0)
-        rewards = []
-        discounted_reward = 0
-        for reward, is_terminal in zip(old_rewards, old_is_terminals):
-            if is_terminal:
-                discounted_reward = 0
-            discounted_reward = reward + (self.params.gamma * discounted_reward)
-            rewards.insert(0, discounted_reward)
+        # # Monte Carlo estimate of returns
+        # # Reverse the tensors
+        # old_rewards = old_rewards.flip(0)
+        # old_is_terminals = old_is_terminals.flip(0)
+        # rewards = []
+        # discounted_reward = 0
+        # for reward, is_terminal in zip(old_rewards, old_is_terminals):
+        #     if is_terminal:
+        #         discounted_reward = 0
+        #     discounted_reward = reward + (self.params.gamma * discounted_reward)
+        #     rewards.insert(0, discounted_reward)
 
-        # Normalizing the rewards
+        # # Normalizing the rewards
         rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
 
