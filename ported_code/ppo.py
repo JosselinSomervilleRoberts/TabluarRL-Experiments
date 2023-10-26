@@ -71,7 +71,49 @@ class RolloutBuffer:
         self.is_terminals[self.index] = is_terminal
         self.index = (self.index + 1) % self.max_buffer_size
         self.num_entries = min(self.num_entries + 1, self.max_buffer_size)
-        # print(self.num_entries)
+
+    def add_buffer(self, buffer: "RolloutBuffer") -> None:
+        """Adds the contents of another buffer to this buffer
+
+        Args:
+            buffer (RolloutBuffer): The buffer to add
+        """
+        if buffer.max_buffer_size > self.max_buffer_size:
+            raise ValueError("Buffer too large")
+
+        # Split into bulks so that if fits in the buffer (at most 2 bulks):
+        # - from self.index to min(self.index + buffer.num_entries, self.max_buffer_size)
+        # - from 0 to max(0, self.index + buffer.num_entries - self.max_buffer_size)
+
+        # First bulk
+        bulk_size = min(buffer.num_entries, self.max_buffer_size - self.index)
+        self.actions[self.index : self.index + bulk_size] = buffer.actions[:bulk_size]
+        self.states[self.index : self.index + bulk_size] = buffer.states[:bulk_size]
+        self.logprobs[self.index : self.index + bulk_size] = buffer.logprobs[:bulk_size]
+        self.rewards[self.index : self.index + bulk_size] = buffer.rewards[:bulk_size]
+        self.state_values[self.index : self.index + bulk_size] = buffer.state_values[
+            :bulk_size
+        ]
+        self.is_terminals[self.index : self.index + bulk_size] = buffer.is_terminals[
+            :bulk_size
+        ]
+        self.num_entries = min(self.num_entries + bulk_size, self.max_buffer_size)
+        self.index = (self.index + bulk_size) % self.max_buffer_size
+
+        # Second bulk
+        if bulk_size == buffer.num_entries:
+            return  # Everything has already been added
+        bulk_size = buffer.num_entries - bulk_size
+        self.actions[:bulk_size] = buffer.actions[-bulk_size:]
+        self.states[:bulk_size] = buffer.states[-bulk_size:]
+        self.logprobs[:bulk_size] = buffer.logprobs[-bulk_size:]
+        self.rewards[:bulk_size] = buffer.rewards[-bulk_size:]
+        self.state_values[:bulk_size] = buffer.state_values[-bulk_size:]
+        self.is_terminals[:bulk_size] = buffer.is_terminals[-bulk_size:]
+        self.num_entries = (
+            self.max_buffer_size
+        )  # If we reached here, it means we looped around
+        self.index = bulk_size
 
     def sample(self, batch_size: int) -> Tuple[torch.Tensor, ...]:
         """Samples a batch from the buffer
@@ -256,6 +298,13 @@ def collect_trajectories_serial(
     total_reward: float = 0.0
     num_timesteps: int = 0
 
+    episode_buffer = RolloutBuffer(
+        state_dim=agent.policy.state_dim,
+        action_dim=1,  # ,agent.policy.action_dim,
+        max_buffer_size=agent.params.max_ep_len,
+        device=agent.device,
+    )
+
     while True:
         (
             action,
@@ -267,7 +316,7 @@ def collect_trajectories_serial(
         state, reward, done, _, _ = env.step(action)
 
         # store the transition in buffer
-        agent.buffer.add(
+        episode_buffer.add(
             state=past_state,
             action=action_stored,
             logprob=action_logprob,
@@ -281,6 +330,8 @@ def collect_trajectories_serial(
         current_ep_reward += reward
 
         if done or current_num_timesteps >= agent.params.max_ep_len:
+            agent.buffer.add_buffer(episode_buffer)
+            episode_buffer.clear()
             num_episodes += 1
             total_reward += current_ep_reward
             # print(
