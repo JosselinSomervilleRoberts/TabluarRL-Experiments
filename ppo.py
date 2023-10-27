@@ -14,6 +14,12 @@ from torch.distributions import Categorical
 from toolbox.printing import debug
 
 
+import matplotlib.pyplot as plt
+import numpy as np
+from envs.ground_truth import load_ground_truth, GroundTruth, draw_policy
+from envs.mapping import construct_value_grid_from_tabular
+
+
 ################################## PPO Policy ##################################
 
 
@@ -160,15 +166,15 @@ class RolloutBuffer:
         # weights = 0.01 + self.rewards_to_go[: self.num_entries].reshape(-1)
         # debug(weights)
         # indices = torch.multinomial(weights, batch_size)
-        indices = torch.where(self.rewards_to_go > 0)[0]
-        if indices.shape[0] < 100:
-            indices = torch.randint(0, self.num_entries, (batch_size,))
-        debug(indices)
-        debug(self.rewards_to_go[indices])
-        debug(
-            torch.sum(self.rewards_to_go[indices].detach().squeeze()) / indices.shape[0]
-        )
-        # indices = torch.randint(0, self.num_entries, (batch_size,))
+        # indices = torch.where(self.rewards_to_go > 0)[0]
+        # if indices.shape[0] < 100:
+        #     indices = torch.randint(0, self.num_entries, (batch_size,))
+        # debug(indices)
+        # debug(self.rewards_to_go[indices])
+        # debug(
+        #     torch.sum(self.rewards_to_go[indices].detach().squeeze()) / indices.shape[0]
+        # )
+        indices = torch.randint(0, self.num_entries, (batch_size,))
         return (
             self.states[indices].detach().squeeze(),
             self.actions[indices].detach().squeeze(),
@@ -496,11 +502,13 @@ class TabularPolicy(Policy):
         self.num_actions = num_actions
 
         self.actor_table = nn.Parameter(
-            torch.rand((num_states, num_actions), device=device), requires_grad=True
+            torch.rand((num_states, num_actions), device=device), requires_grad=False
         )
+        self.actor_table[:, 0] = -100000
+        self.actor_table.requires_grad = True
 
         self.critic_table = nn.Parameter(
-            torch.rand((num_states, 1), device=device), requires_grad=True
+            torch.zeros((num_states, 1), device=device), requires_grad=True
         )
 
     def actor(self, state: torch.Tensor) -> torch.Tensor:
@@ -965,6 +973,22 @@ class PPO(Agent):
                         i_episode, time_step, print_avg_reward
                     )
                 )
+
+                # if self.gt does not exist, load it
+                if not hasattr(self, "gt"):
+                    self.gt: GroundTruth = load_ground_truth(env.name)
+                V: np.ndarray = self.policy_old.critic_table.detach().cpu().numpy()
+                Q = self.policy_old.actor_table.detach().cpu().numpy()
+                V_grid, _ = construct_value_grid_from_tabular(
+                    V, self.gt.mapping, self.gt.width, self.gt.height
+                )
+                # debug(V_grid)
+                debug(Q)
+                plt.imshow(V_grid[:, :, 0].T)
+                draw_policy(mapping=self.gt.mapping, Q=Q)
+                plt.colorbar()
+                plt.savefig(f"plots/{env.name}_{i_episode}_{time_step}.png")
+                plt.close()
 
                 print_running_reward = 0
                 print_running_episodes = 0

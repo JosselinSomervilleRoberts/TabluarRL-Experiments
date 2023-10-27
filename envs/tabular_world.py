@@ -250,10 +250,8 @@ class TabularWorld:
             self.observations, self.actions
         ].squeeze()
 
-        # self.dones[...] = (
-        #     (self.observations == self.transitions.shape[0] - 1).int().squeeze()
-        # )
-        self.dones = self.rewards > 0
+        self.dones = self.observations == self.transitions.shape[0] - 1
+        # self.dones = self.rewards > 0
 
         # Reset all the dones
         self.observations[self.dones == 1] = 0

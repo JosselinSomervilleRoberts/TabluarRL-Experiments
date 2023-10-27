@@ -48,7 +48,7 @@ print(
 # env = gym.make(env_name)
 
 
-env_name = "MiniGrid-BlockedUnlockPickup-v0"
+env_name = "MiniGrid-FourRooms-v0"
 data_dir = "data/"
 file_name = f"{data_dir}/{env_name}/consolidated.npz"
 random_seed = 0  # set random seed if required (0 = no random seed)
@@ -134,13 +134,13 @@ print("save checkpoint path : " + checkpoint_path)
 
 params = PPOTrainingParameters(
     max_training_timesteps=int(1e8),
-    max_ep_len=80,
-    update_timestep=env.num_worlds * 75,
-    K_epochs=40,
+    max_ep_len=200,
+    update_timestep=env.num_worlds * 200,
+    K_epochs=10,
     eps_clip=0.2,
-    gamma=0.97,
-    lr_actor=0.003,
-    lr_critic=0.01,
+    gamma=0.95,
+    lr_actor=0.0003,
+    lr_critic=0.001,
     update_batch_size=4096 * 8,
 )
 
@@ -148,7 +148,7 @@ params = PPOTrainingParameters(
 def policy_factory():
     return TabularPolicy(
         num_states=env.num_states,
-        num_actions=env.num_actions,
+        num_actions=3,  # env.num_actions,
         device=device,
     )
 
@@ -159,6 +159,15 @@ ppo_agent = PPO(
     collect_trajectory_fn=collect_trajectories_parallel,
     params=params,
     device=device,
+)
+
+print(
+    "============================================================================================"
+)
+print(f"Num states: {env.num_states}")
+print(f"Num actions: {env.num_actions}")
+print(
+    "============================================================================================"
 )
 
 ppo_agent.train(
