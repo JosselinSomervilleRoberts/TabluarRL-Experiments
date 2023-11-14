@@ -3,6 +3,10 @@ output/
 data/
 .vscode/
 wandb/
+data_atari/
+data_new/
+plots/*
+PPO_logs/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

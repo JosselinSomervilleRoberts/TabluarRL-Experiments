@@ -19,7 +19,7 @@ def parse_args():
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="data/",
+        default="data_new/",
         help="Directory containing the MDPs.",
     )
     parser.add_argument(

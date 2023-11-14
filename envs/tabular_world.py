@@ -7,6 +7,8 @@ import torch
 
 from .mdp_utils import load_mdp_from_npz
 
+from toolbox.printing import debug
+
 # Actions
 ACTION_LEFT = 0
 ACTION_RIGHT = 1
@@ -232,10 +234,16 @@ class TabularWorld:
 
     def apply_force_reset(self):
         """Resets the worlds that have force_reset set"""
-        self.observations[self.force_reset] = 0
+        if self.num_worlds == 1:
+            self.observations[...] = 0 if self.force_reset else self.observations
+        else:
+            self.observations[self.force_reset] = 0
         self.force_reset[...] = 0
 
-    def step(self):
+    def step(self, action: Optional[torch.Tensor] = None):
+        if action is not None:
+            self.actions[...] = action
+
         # Apply force_reset where needed
         self.apply_force_reset()
 
@@ -259,6 +267,8 @@ class TabularWorld:
         # print(self.dones.shape)
         self.observations[self.dones == 1] = 0
 
+        return self.observations, self.rewards, self.dones, {}, {}
+
     def reset(self, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Reset the environment for the worlds specified by the mask.
         if not specified, reset all worlds.
@@ -269,13 +279,24 @@ class TabularWorld:
         Returns:
             observations: The initial observations.
         """
-        if mask is None:
-            mask = torch.ones((self.num_worlds,), dtype=torch.int32, device=self.device)
-        self.observations[mask] = 0
+        if self.num_worlds == 1:
+            if mask is None:
+                self.observations[...] = 0
+            else:
+                self.observations[...] = 0 if mask else self.observations
+        else:
+            if mask is None:
+                mask = torch.ones(
+                    (self.num_worlds,), dtype=torch.int32, device=self.device
+                )
+            self.observations[mask] = 0
         self.force_reset[...] = 1
         self.dones[...] = 0
         self.rewards[...] = 0
-        return self.observations
+        return self.observations, {}
+
+    def close(self):
+        pass
 
 
 class TabularWorldWithStateMapper(TabularWorld):

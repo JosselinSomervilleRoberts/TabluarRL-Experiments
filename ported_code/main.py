@@ -3,7 +3,16 @@ import os
 import torch
 import gym
 
-from ppo import PPO, PPOTrainingParameters, DeepPolicy, collect_trajectories_serial
+from ppo import (
+    PPO,
+    PPOTrainingParameters,
+    DeepPolicy,
+    collect_trajectories_serial,
+    TabularPolicy,
+    collect_trajectories_parallel,
+)
+
+from envs.tabular_world import TabularWorld
 
 
 ################################## set device ##################################
@@ -32,11 +41,40 @@ print(
     "============================================================================================"
 )
 
-env_name = "CartPole-v1"
-has_continuous_action_space = False
-action_std = None
-random_seed = 0  # set random seed if required (0 = no random seed)
-env = gym.make(env_name)
+# Parse from command line env_type
+import argparse
+
+parser = argparse.ArgumentParser(description="Process the environment type.")
+
+# Add the env_type argument
+# The 'dest' parameter is optional. It defines the name of the attribute where the parsed value will be stored.
+# If 'dest' is not provided, argparse will use the option string ('--env_type' in this case) to determine the name.
+parser.add_argument(
+    "--env_type",
+    type=str,
+    required=True,
+    help="The type of environment (e.g., tabular, gym)",
+)
+
+# Parse the arguments
+args = parser.parse_args()
+env_type = args.env_type
+
+
+if env_type == "gym":
+    env_name = "CartPole-v1"
+    has_continuous_action_space = False
+    action_std = None
+    random_seed = 0  # set random seed if required (0 = no random seed)
+    env = gym.make(env_name)
+elif env_type == "tabular":
+    env_name = "MiniGrid-DoorKey-8x8-OpenDoorsPickupShaped-v0"
+    data_dir = "data_new/"
+    file_name = f"{data_dir}/{env_name}/consolidated.npz"
+    random_seed = 0  # set random seed if required (0 = no random seed)
+    env = TabularWorld(file_name, num_worlds=4096, device=device)
+else:
+    raise ValueError(f"Environment {env_type} not supported.")
 
 print("training environment name : " + env_name)
 
@@ -91,35 +129,58 @@ print("save checkpoint path : " + checkpoint_path)
 
 #####################################################
 
-
-params = PPOTrainingParameters(
-    max_training_timesteps=int(1e5),
-    max_ep_len=400,
-    update_timestep=1600,
-    K_epochs=40,
-    eps_clip=0.2,
-    gamma=0.99,
-    lr_actor=0.0003,
-    lr_critic=0.001,
-)
-
-
-def policy_factory():
-    return DeepPolicy(
-        state_dim=env.observation_space.shape[0],
-        action_dim=env.action_space.shape[0]
-        if has_continuous_action_space
-        else env.action_space.n,
-        has_continuous_action_space=has_continuous_action_space,
-        action_std_init=action_std,
-        device=device,
+if env_type == "gym":
+    params = PPOTrainingParameters(
+        max_training_timesteps=int(1e5),
+        max_ep_len=400,
+        update_timestep=1600,
+        update_batch_size=1600,
+        K_epochs=40,
+        eps_clip=0.2,
+        gamma=0.99,
+        lr_actor=0.0003,
+        lr_critic=0.001,
+        state_type=torch.float32,
     )
+
+    def policy_factory():
+        return DeepPolicy(
+            state_dim=env.observation_space.shape[0],
+            action_dim=env.action_space.shape[0]
+            if has_continuous_action_space
+            else env.action_space.n,
+            has_continuous_action_space=has_continuous_action_space,
+            action_std_init=action_std,
+            device=device,
+        )
+
+    collect_trajectory_fn = collect_trajectories_serial
+else:
+    params = PPOTrainingParameters(
+        max_training_timesteps=int(1e8),
+        max_ep_len=80,
+        update_timestep=env.num_worlds * 80,
+        K_epochs=40,
+        eps_clip=0.2,
+        gamma=0.99,
+        lr_actor=0.0003,
+        lr_critic=0.001,
+        update_batch_size=env.num_worlds * 80,
+        state_type=torch.int32,
+    )
+
+    def policy_factory():
+        return TabularPolicy(
+            num_states=env.num_states, num_actions=env.num_actions, device=device
+        )
+
+    collect_trajectory_fn = collect_trajectories_parallel
 
 
 # initialize a PPO agent
 ppo_agent = PPO(
     policy_builder=policy_factory,
-    collect_trajectory_fn=collect_trajectories_serial,
+    collect_trajectory_fn=collect_trajectory_fn,
     params=params,
     device=device,
 )

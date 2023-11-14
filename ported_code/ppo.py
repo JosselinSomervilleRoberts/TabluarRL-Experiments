@@ -3,13 +3,21 @@
 from abc import abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, List
+
+import matplotlib.pyplot as plt
+import numpy as np
+from envs.ground_truth import load_ground_truth, GroundTruth, draw_policy
+from envs.mapping import construct_value_grid_from_tabular
 
 
+import gym
 import torch
 import torch.nn as nn
 from torch.distributions import MultivariateNormal
 from torch.distributions import Categorical
+
+from toolbox.printing import debug
 
 
 ################################## PPO Policy ##################################
@@ -166,6 +174,7 @@ class BatchedRolloutBuffer:
         state_dim: int,
         batch_size: int,
         action_dim: int,
+        state_type,
         max_buffer_size: int = 1000000,
         device: torch.device = torch.device("cpu"),
     ):
@@ -176,7 +185,7 @@ class BatchedRolloutBuffer:
         self.device = device
 
         self.states = torch.zeros(
-            (batch_size, max_ep_len, state_dim), dtype=torch.float32, device=device
+            (batch_size, max_ep_len, state_dim), dtype=state_type, device=device
         )
         self.actions = torch.zeros(
             (batch_size, max_ep_len, action_dim), dtype=torch.int64, device=device
@@ -214,12 +223,20 @@ class BatchedRolloutBuffer:
         is_terminals: torch.Tensor,
     ) -> None:
         # All tensors are of shape (batch_size, state_dim/action_dim/1)
-        self.states[:, self.episode_indices] = states
-        self.actions[:, self.episode_indices] = actions
-        self.logprobs[:, self.episode_indices] = logprobs
-        self.rewards[:, self.episode_indices] = rewards
-        self.state_values[:, self.episode_indices] = state_values
-        self.is_terminals[:, self.episode_indices] = is_terminals
+        row_indices = torch.arange(self.batch_size)
+        col_indices = self.episode_indices
+
+        # All tensors are of shape (batch_size, state_dim/action_dim/1)
+        self.states[row_indices, col_indices] = states.reshape(self.batch_size, -1)
+        self.actions[row_indices, col_indices] = actions.reshape(self.batch_size, -1)
+        self.logprobs[row_indices, col_indices] = logprobs.reshape(self.batch_size, -1)
+        self.rewards[row_indices, col_indices] = rewards.reshape(self.batch_size, -1)
+        self.state_values[row_indices, col_indices] = state_values.reshape(
+            self.batch_size, -1
+        )
+        self.is_terminals[row_indices, col_indices] = is_terminals.reshape(
+            self.batch_size, -1
+        )
         self.episode_indices += 1
 
         # Handle episodes that are done and add them to the linear buffer
@@ -334,7 +351,7 @@ class Policy(nn.Module):
 
         action_logprobs = dist.log_prob(action)
         dist_entropy = dist.entropy()
-        state_values = self.critic(state)
+        state_values = self.critic(state)  # Shape: (batch_size, 1)
 
         return action_logprobs, state_values, dist_entropy
 
@@ -396,6 +413,109 @@ class DeepPolicy(Policy):
             nn.Linear(64, 1),
         )
 
+    def get_actor_params(self) -> List[nn.Parameter]:
+        return self.actor.parameters()
+
+    def get_critic_params(self) -> List[nn.Parameter]:
+        return self.critic.parameters()
+
+
+class TabularPolicy(Policy):
+    def __init__(
+        self,
+        num_states: int,
+        num_actions: int,
+        device: torch.device = torch.device("cpu"),
+    ):
+        super().__init__(
+            state_dim=1,
+            action_dim=1,
+            has_continuous_action_space=False,
+            action_std_init=None,
+            device=device,
+        )
+        self.num_states = num_states
+        self.num_actions = num_actions
+
+        self.actor_table = nn.Parameter(
+            torch.ones((num_states, num_actions), device=device), requires_grad=True
+        )
+
+        self.critic_table = nn.Parameter(
+            torch.zeros((num_states, 1), device=device), requires_grad=True
+        )
+
+    def actor(self, state: torch.Tensor) -> torch.Tensor:
+        values = self.actor_table[state.long()]
+        return torch.softmax(values, dim=-1)
+
+    def critic(self, state: torch.Tensor) -> torch.Tensor:
+        return self.critic_table[state.long()]
+
+    def get_actor_params(self) -> List[nn.Parameter]:
+        return [self.actor_table]
+
+    def get_critic_params(self) -> List[nn.Parameter]:
+        return [self.critic_table]
+
+
+def collect_trajectories_parallel(
+    env, agent: "Agent", num_timesteps_required: int
+) -> int:
+    batch_size: int = env.num_worlds
+
+    state, _ = env.reset()
+    current_ep_reward: torch.Tensor = torch.zeros((batch_size,), device=agent.device)
+    current_num_timesteps: torch.Tensor = torch.zeros(
+        (batch_size,), device=agent.device, dtype=torch.int32
+    )
+
+    # Infos collected
+    num_episodes: int = 0
+    total_reward: float = 0.0
+    num_timesteps: int = 0
+
+    while True:
+        (
+            action,
+            action_stored,
+            past_state,
+            action_logprob,
+            state_val,
+        ) = agent.select_action(state)
+        state, reward, done, _, _ = env.step(action)
+        current_num_timesteps += 1
+        current_ep_reward += reward
+
+        # Stops episodes that are too long
+        done[current_num_timesteps >= agent.params.max_ep_len] = True
+
+        # store the transition in buffer
+        agent.buffer.batch_add(
+            states=past_state,
+            actions=action_stored,
+            logprobs=action_logprob,
+            rewards=reward,
+            state_values=state_val,
+            is_terminals=done,
+        )
+
+        if torch.any(done):
+            num_episodes += torch.sum(done).cpu().item()
+            total_reward += torch.sum(current_ep_reward[done]).cpu().item()
+            num_timesteps += torch.sum(current_num_timesteps[done]).cpu().item()
+
+            # We collected enough timesteps
+            if num_timesteps >= num_timesteps_required:
+                break
+
+            # Reset environments that are done
+            state, _ = env.reset(done)
+            current_num_timesteps[done] = 0
+            current_ep_reward[done] = 0
+
+    return num_timesteps, num_episodes, total_reward
+
 
 def collect_trajectories_serial(
     env, agent: "Agent", num_timesteps_required: int
@@ -425,6 +545,9 @@ def collect_trajectories_serial(
             action_logprob,
             state_val,
         ) = agent.select_action(state)
+        # If it's a gym environment, we need to convert the action to a numpy array
+        if hasattr(env, "action_space"):
+            action = int(action)
         state, reward, done, _, _ = env.step(action)
         num_timesteps += 1
         current_num_timesteps += 1
@@ -482,6 +605,8 @@ class TrainingParameters:
     # Learning rate for critic
     lr_critic: float
 
+    state_type: type
+
 
 @dataclass
 class PPOTrainingParameters(TrainingParameters):
@@ -494,6 +619,9 @@ class PPOTrainingParameters(TrainingParameters):
 
     # Epsilon for clipping
     eps_clip: float
+
+    # Batch size for each update
+    update_batch_size: int
 
     # =========== Continuous =========== #
     # Starting std for continuous action distribution (Multivariate Normal)
@@ -519,6 +647,7 @@ class Agent:
             batch_size=1,
             state_dim=self.policy.state_dim,
             action_dim=1,  # ,self.policy.action_dim,
+            state_type=params.state_type,
             device=self.device,
         )
 
@@ -537,13 +666,14 @@ class Agent:
         """
 
         with torch.no_grad():
-            state = torch.FloatTensor(state).to(self.device)
+            if not isinstance(state, torch.Tensor):
+                state = torch.FloatTensor(state).to(self.device)
             action_tensor, action_logprob, state_val = self.policy_old.act(state)
 
         if self.has_continuous_action_space:
             action = action_tensor.detach().cpu().numpy().flatten()
         else:
-            action = action_tensor.item()
+            action = action_tensor.detach()
 
         return action, action_tensor, state, action_logprob, state_val
 
@@ -630,10 +760,7 @@ class PPO(Agent):
             old_rewards,
             old_state_values,
             old_is_terminals,
-        ) = self.buffer.sample(
-            0
-        )  # TODO: Change this to batch_size
-        # debug(self.buffer.linear_buffer.num_entries)
+        ) = self.buffer.sample(self.params.update_batch_size)
 
         # Monte Carlo estimate of returns
         # Reverse the tensors
@@ -721,14 +848,41 @@ class PPO(Agent):
         # Training stuff
         self.optimizer = torch.optim.Adam(
             [
-                {"params": self.policy.actor.parameters(), "lr": self.params.lr_actor},
+                {"params": self.policy.get_actor_params(), "lr": self.params.lr_actor},
                 {
-                    "params": self.policy.critic.parameters(),
+                    "params": self.policy.get_critic_params(),
                     "lr": self.params.lr_critic,
                 },
             ]
         )
         self.MseLoss = nn.MSELoss()
+
+        # If env has a property called num_worlds, we can use it to parallelize
+        batch_size: int = env.num_worlds if hasattr(env, "num_worlds") else 1
+
+        # The most number of timesteps we can have is ir we start collecting a rollout
+        # at time_step = self.params.max_training_timesteps - 1
+        # The maximum size of a rollout is:
+        # self.params.update_timestep - 1 + self.params.max_ep_len * batch_size
+        max_buffer_size: int = (
+            self.params.max_training_timesteps
+            + self.params.update_timestep
+            - 1
+            + self.params.max_ep_len * batch_size
+            + 1  # To account for errors in the code
+        )
+        # from toolbox.printing import debug
+
+        # debug(self.policy.action_dim if not self.has_continuous_action_space else 1)
+        self.buffer = BatchedRolloutBuffer(
+            max_ep_len=self.params.max_ep_len,
+            batch_size=batch_size,
+            state_dim=self.policy.state_dim,
+            action_dim=1,
+            device=self.device,
+            state_type=self.params.state_type,
+            max_buffer_size=max_buffer_size,
+        )
 
         # track total training time
         start_time = datetime.now().replace(microsecond=0)
@@ -773,6 +927,8 @@ class PPO(Agent):
             if time_step % log_freq == 0:
                 # log average reward till last episode
                 log_avg_reward = log_running_reward / log_running_episodes
+                if isinstance(log_avg_reward, torch.Tensor):
+                    log_avg_reward = log_avg_reward.cpu().item()
                 log_avg_reward = round(log_avg_reward, 4)
 
                 log_f.write("{},{},{}\n".format(i_episode, time_step, log_avg_reward))
@@ -785,7 +941,9 @@ class PPO(Agent):
             if time_step % print_freq == 0:
                 # print average reward till last episode
                 print_avg_reward = print_running_reward / print_running_episodes
-                print_avg_reward = round(print_avg_reward, 2)
+                if isinstance(print_avg_reward, torch.Tensor):
+                    print_avg_reward = print_avg_reward.cpu().item()
+                print_avg_reward = round(print_avg_reward, 5)
 
                 print(
                     "Episode : {} \t\t Timestep : {} \t\t Average Reward : {}".format(
@@ -795,6 +953,22 @@ class PPO(Agent):
 
                 print_running_reward = 0
                 print_running_episodes = 0
+
+                # if self.gt does not exist, load it
+                if not hasattr(self, "gt"):
+                    self.gt: GroundTruth = load_ground_truth(env.name)
+                V: np.ndarray = self.policy_old.critic_table.detach().cpu().numpy()
+                Q = self.policy_old.actor_table.detach().cpu().numpy()
+                V_grid, _ = construct_value_grid_from_tabular(
+                    V, self.gt.mapping, self.gt.width, self.gt.height
+                )
+                # debug(V_grid)
+                # debug(Q)
+                plt.imshow(V_grid[:, :, 0].T)
+                draw_policy(mapping=self.gt.mapping, Q=Q)
+                plt.colorbar()
+                plt.savefig(f"plots/{env.name}_{i_episode}_{time_step}.png")
+                plt.close()
 
             # save model weights
             if time_step % save_model_freq == 0:
