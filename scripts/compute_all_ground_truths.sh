@@ -1,7 +1,7 @@
 # For all foder names <folder_name> in ../data/
 # Run python scripts/compute_ground_truth.py --env_name <folder_name>
 
-for folder_name in $(ls data/); do
+for folder_name in $(ls data_new/); do
     echo "-----------------------------------"
     echo $folder_name
     PYTHONPATH=. python scripts/compute_ground_truth.py --env_name $folder_name

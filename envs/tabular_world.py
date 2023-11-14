@@ -7,6 +7,8 @@ import torch
 
 from .mdp_utils import load_mdp_from_npz
 
+from toolbox.printing import debug
+
 # Actions
 ACTION_LEFT = 0
 ACTION_RIGHT = 1
@@ -232,7 +234,10 @@ class TabularWorld:
 
     def apply_force_reset(self):
         """Resets the worlds that have force_reset set"""
-        self.observations[self.force_reset] = 0
+        if self.num_worlds == 1:
+            self.observations[...] = 0 if self.force_reset else self.observations
+        else:
+            self.observations[self.force_reset] = 0
         self.force_reset[...] = 0
 
     def step(self, action: Optional[torch.Tensor] = None):
@@ -268,9 +273,17 @@ class TabularWorld:
         Returns:
             observations: The initial observations.
         """
-        if mask is None:
-            mask = torch.ones((self.num_worlds,), dtype=torch.int32, device=self.device)
-        self.observations[mask] = 0
+        if self.num_worlds == 1:
+            if mask is None:
+                self.observations[...] = 0
+            else:
+                self.observations[...] = 0 if mask else self.observations
+        else:
+            if mask is None:
+                mask = torch.ones(
+                    (self.num_worlds,), dtype=torch.int32, device=self.device
+                )
+            self.observations[mask] = 0
         self.force_reset[...] = 1
         self.dones[...] = 0
         self.rewards[...] = 0

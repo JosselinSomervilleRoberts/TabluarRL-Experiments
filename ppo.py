@@ -5,19 +5,19 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Optional, Tuple, List
 
+import matplotlib.pyplot as plt
+import numpy as np
+from envs.ground_truth import load_ground_truth, GroundTruth, draw_policy
+from envs.mapping import construct_value_grid_from_tabular
 
+
+import gym
 import torch
 import torch.nn as nn
 from torch.distributions import MultivariateNormal
 from torch.distributions import Categorical
 
 from toolbox.printing import debug
-
-
-import matplotlib.pyplot as plt
-import numpy as np
-from envs.ground_truth import load_ground_truth, GroundTruth, draw_policy
-from envs.mapping import construct_value_grid_from_tabular
 
 
 ################################## PPO Policy ##################################
@@ -200,6 +200,7 @@ class BatchedRolloutBuffer:
         state_dim: int,
         batch_size: int,
         action_dim: int,
+        state_type,
         max_buffer_size: int = 1000000,
         device: torch.device = torch.device("cpu"),
     ):
@@ -210,7 +211,7 @@ class BatchedRolloutBuffer:
         self.device = device
 
         self.states = torch.zeros(
-            (batch_size, max_ep_len, state_dim), dtype=torch.int32, device=device
+            (batch_size, max_ep_len, state_dim), dtype=state_type, device=device
         )
         self.actions = torch.zeros(
             (batch_size, max_ep_len, action_dim), dtype=torch.int64, device=device
@@ -247,6 +248,10 @@ class BatchedRolloutBuffer:
         state_values: torch.Tensor,
         is_terminals: torch.Tensor,
     ) -> None:
+        row_indices = torch.arange(self.batch_size)
+        col_indices = self.episode_indices
+
+        # All tensors are of shape (batch_size, state_dim/action_dim/1)
         row_indices = torch.arange(self.batch_size)
         col_indices = self.episode_indices
 
@@ -502,10 +507,8 @@ class TabularPolicy(Policy):
         self.num_actions = num_actions
 
         self.actor_table = nn.Parameter(
-            torch.rand((num_states, num_actions), device=device), requires_grad=False
+            torch.ones((num_states, num_actions), device=device), requires_grad=True
         )
-        self.actor_table[:, 0] = -100000
-        self.actor_table.requires_grad = True
 
         self.critic_table = nn.Parameter(
             torch.zeros((num_states, 1), device=device), requires_grad=True
@@ -603,6 +606,9 @@ def collect_trajectories_serial(
             action_logprob,
             state_val,
         ) = agent.select_action(state)
+        # If it's a gym environment, we need to convert the action to a numpy array
+        if hasattr(env, "action_space"):
+            action = int(action)
         state, reward, done, _, _ = env.step(action)
         num_timesteps += 1
         current_num_timesteps += 1
@@ -652,6 +658,8 @@ class TrainingParameters:
     # Learning rate for critic
     lr_critic: float
 
+    state_type: type
+
 
 @dataclass
 class PPOTrainingParameters(TrainingParameters):
@@ -687,6 +695,15 @@ class Agent:
         self.policy: Policy = policy_builder().to(self.device)
         self.collect_trajectory_fn: callable = collect_trajectory_fn
 
+        self.buffer = BatchedRolloutBuffer(
+            max_ep_len=400,
+            batch_size=1,
+            state_dim=self.policy.state_dim,
+            action_dim=1,  # ,self.policy.action_dim,
+            state_type=params.state_type,
+            device=self.device,
+        )
+
     def select_action(self, state: torch.Tensor) -> torch.Tensor:
         """Selects an action to take given a state
 
@@ -710,7 +727,6 @@ class Agent:
             action = action_tensor.detach().cpu().numpy().flatten()
         else:
             action = action_tensor.detach()
-            # action = action_tensor.item()
 
         return action, action_tensor, state, action_logprob, state_val
 
@@ -795,7 +811,6 @@ class PPO(Agent):
             old_rewards,
             old_state_values,
             old_is_terminals,
-            rewards,
         ) = self.buffer.sample(self.params.update_batch_size)
 
         # # Monte Carlo estimate of returns
@@ -901,14 +916,16 @@ class PPO(Agent):
             + self.params.max_ep_len * batch_size
             + 1  # To account for errors in the code
         )
+        # from toolbox.printing import debug
+
+        # debug(self.policy.action_dim if not self.has_continuous_action_space else 1)
         self.buffer = BatchedRolloutBuffer(
             max_ep_len=self.params.max_ep_len,
             batch_size=batch_size,
             state_dim=self.policy.state_dim,
-            action_dim=self.policy.action_dim
-            if not self.has_continuous_action_space
-            else 1,
+            action_dim=1,
             device=self.device,
+            state_type=self.params.state_type,
             max_buffer_size=max_buffer_size,
         )
 
@@ -954,6 +971,8 @@ class PPO(Agent):
             if time_step % log_freq == 0:
                 # log average reward till last episode
                 log_avg_reward = log_running_reward / log_running_episodes
+                if isinstance(log_avg_reward, torch.Tensor):
+                    log_avg_reward = log_avg_reward.cpu().item()
                 log_avg_reward = round(log_avg_reward, 4)
 
                 log_f.write("{},{},{}\n".format(i_episode, time_step, log_avg_reward))
@@ -966,6 +985,8 @@ class PPO(Agent):
             if time_step % print_freq == 0:
                 # print average reward till last episode
                 print_avg_reward = print_running_reward / print_running_episodes
+                if isinstance(print_avg_reward, torch.Tensor):
+                    print_avg_reward = print_avg_reward.cpu().item()
                 print_avg_reward = round(print_avg_reward, 5)
 
                 print(
@@ -992,6 +1013,22 @@ class PPO(Agent):
 
                 print_running_reward = 0
                 print_running_episodes = 0
+
+                # if self.gt does not exist, load it
+                if not hasattr(self, "gt"):
+                    self.gt: GroundTruth = load_ground_truth(env.name)
+                V: np.ndarray = self.policy_old.critic_table.detach().cpu().numpy()
+                Q = self.policy_old.actor_table.detach().cpu().numpy()
+                V_grid, _ = construct_value_grid_from_tabular(
+                    V, self.gt.mapping, self.gt.width, self.gt.height
+                )
+                # debug(V_grid)
+                # debug(Q)
+                plt.imshow(V_grid[:, :, 0].T)
+                draw_policy(mapping=self.gt.mapping, Q=Q)
+                plt.colorbar()
+                plt.savefig(f"plots/{env.name}_{i_episode}_{time_step}.png")
+                plt.close()
 
             # save model weights
             if time_step % save_model_freq == 0:

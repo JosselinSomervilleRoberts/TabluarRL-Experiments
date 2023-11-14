@@ -323,9 +323,9 @@ class QLearning:
 
 if __name__ == "__main__":
     # Create the tabular world
-    env_name = "MiniGrid-BlockedUnlockPickup-v0"
+    env_name = "MiniGrid-BlockedUnlockPickup-DistanceShaped-v0"
     # env_name = "MiniGrid-Empty-8x8-v0"
-    data_dir = "data/"
+    data_dir = "data_new/"
     file_name = f"{data_dir}/{env_name}/consolidated.npz"
     world = TabularWorld(file_name, num_worlds=32000, device="cuda")
 
@@ -334,14 +334,14 @@ if __name__ == "__main__":
         num_states=world.num_states,
         num_actions=world.num_actions,
         num_worlds=world.num_worlds,
-        learning_rate_start=0.2,
+        learning_rate_start=0.02,
         learning_rate_end=0.0001,
         discount_factor=0.95,
-        exploration_prob_start=0.5,
+        exploration_prob_start=0.8,
         exploration_prob_end=0.1,
-        exploration_step_end=2500,
-        total_num_steps=5000,
-        max_steps_per_episode=70,
+        exploration_step_end=15000,
+        total_num_steps=20000,
+        max_steps_per_episode=100,
     )
 
     # Create the Q-learning algorithm

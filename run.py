@@ -8,32 +8,46 @@ import gymnasium as gym
 import matplotlib.pyplot as plt
 from envs.mdp_utils import load_mdp_from_npz, get_sparse_mdp
 from algorithms.value_iteration import run_value_iteration
+from toolbox.printing import debug
+from effective_horizon.envs.deterministic_registration import register_atari_envs
 
+register_atari_envs()
 
-mdp_name = "MiniGrid-Empty-16x16-v0"  # Replace with the name of the BRIDGE MDP.v
+mdp_name = "alien_10_fs30"  # Replace with the name of the BRIDGE MDP.v
 
 transitions, rewards = load_mdp_from_npz(
     f"/home/josselin/Downloads/bridge_dataset/mdps/{mdp_name}/consolidated.npz"
 )
+debug(transitions)
+debug(rewards)
 num_states, num_actions = transitions.shape
 done_state = num_states - 1
+# rewards[done_state] = 1
 tabular_state = 214  # Replace with the index of the tabular state.
 print("Number of states:", num_states)
 print("Number of actions:", num_actions)
 
 # Find indices of rewards equal to 1
-print("Rewards equal to 1:", np.argwhere(rewards == 1))
+print("Number of non-zero rewards: ", 0)
 print("Rewards n - 1:", rewards[num_states - 1, :])
 # one_hot_rewards = np.zeros((num_states, num_actions))
 # one_hot_rewards[tabular_state, :] = 1
 
 sparse_transitions, rewards_vector = get_sparse_mdp(transitions, rewards)
-vi = run_value_iteration(sparse_transitions, rewards_vector, horizon=100, gamma=0.995)
+vi = None  # run_value_iteration(sparse_transitions, rewards_vector, horizon=2, gamma=0.995)
 print("Done!")
 
-env = gym.make(f"{mdp_name}")
+env = gym.make(f"BRIDGE/{mdp_name}")
 obs, infos = env.reset()
-print(obs)
+debug(obs)
+debug(infos)
+# Plot observation
+plt.imshow(obs)
+plt.savefig("obs.png")
+env._render_mode = "rgb_array"
+plt.close()
+debug(env.render())
+# plt.savefig("render.png")
 # Save obs in a txt file
 # np.savetxt("obs.txt", obs[0])
 
@@ -48,7 +62,7 @@ while state != tabular_state:
     # print(obs)
     state = transitions[state, action]
     t += 1
-    env.unwrapped.render_mode = "rgb_array"
+    # env.unwrapped.render_mode = "rgb_array"
     plt.imshow(env.render())
     plt.savefig(f"step_{t}.png")
     print("t =", t, "state =", state)
