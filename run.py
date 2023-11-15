@@ -38,18 +38,18 @@ vi = None  # run_value_iteration(sparse_transitions, rewards_vector, horizon=2, 
 print("Done!")
 
 env = gym.make(f"BRIDGE/{mdp_name}")
-obs, infos = env.reset()
-debug(obs)
-debug(infos)
-# Plot observation
-plt.imshow(obs)
-plt.savefig("obs.png")
-env._render_mode = "rgb_array"
-plt.close()
-debug(env.render())
-# plt.savefig("render.png")
-# Save obs in a txt file
-# np.savetxt("obs.txt", obs[0])
+
+for i in range(5):
+    obs, infos = env.reset()
+    # Plot observation
+    plt.imshow(obs)
+    plt.savefig(f"obs_{i}.png")
+    plt.close()
+    plt.imshow(env.render())
+    plt.savefig(f"render_{i}.png")
+    # plt.savefig("render.png")
+    # Save obs in a txt file
+    # np.savetxt("obs.txt", obs[0])
 
 state, t = 0, 0
 while state != tabular_state:
