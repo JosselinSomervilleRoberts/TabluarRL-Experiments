@@ -3,7 +3,7 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-from typing import List
+from typing import List, Dict
 
 import numpy as np
 import gymnasium as gym
@@ -13,10 +13,11 @@ from algorithms.value_iteration import run_value_iteration
 from toolbox.printing import debug
 from effective_horizon.envs.deterministic_registration import register_atari_envs
 from tqdm import tqdm
+import random
 
 register_atari_envs()
 
-mdp_name = "atlantis_30_fs30"  # Replace with the name of the BRIDGE MDP.v
+mdp_name = "atlantis_50_fs30"  # Replace with the name of the BRIDGE MDP.v
 
 transitions, rewards = load_mdp_from_npz(
     f"/home/josselin/Downloads/bridge_dataset/mdps/{mdp_name}/consolidated.npz"
@@ -35,29 +36,96 @@ print(f"Estimated render data size: {render_data_size:.2f} GB")
 print(f"Estimated obs data size: {obs_data_size:.2f} GB")
 
 
-visited_states = set()
-path_to_state = {
-    0: [],
-}  # Maps a state to the sequence of actions needed from the initial state to reach it.
-states_to_find = set()
-states_to_visit = [0]
-
 # First find a path to each state
 
-with tqdm(total=num_states, desc="Finding paths", unit="states") as pbar:
-    while states_to_visit:
-        state: int = states_to_visit.pop(0)
-        if state in visited_states:
-            continue
-        path: List[int] = path_to_state[state]
-        neighbors = transitions[state, :]
-        for action, neighbor in enumerate(neighbors):
-            if neighbor not in visited_states:
-                states_to_visit.append(neighbor)
-                path_to_state[neighbor] = path + [action]
-        visited_states.add(state)
-        pbar.update(1)
-    pbar.close()
+num_hubs: int = num_states
+hub_states: List[int] = [0]
+hub_states += random.sample(range(1, num_states), num_hubs - 1)
+hub_states.sort()
+# print("Hub states:", hub_states)
+paths_to_states_from_hubs: List[Dict[int, List[int]]] = []
+
+if (
+    True
+):  # with tqdm(total=num_states * num_hubs, desc="Finding paths", unit="states") as pbar:
+    for hub_state in tqdm(hub_states, desc="Hub states", unit="states"):
+        visited_states = set()
+        path_to_state = {
+            hub_state: [],
+        }  # Maps a state to the sequence of actions needed from the initial state to reach it.
+        states_to_find = set()
+        states_to_visit = [hub_state]
+
+        # Path find
+        while states_to_visit:
+            state: int = states_to_visit.pop(0)
+            if state in visited_states:
+                # pbar.update(1)
+                continue
+            path: List[int] = path_to_state[state]
+            neighbors = transitions[state, :]
+            for action, neighbor in enumerate(neighbors):
+                if neighbor not in visited_states:
+                    states_to_visit.append(neighbor)
+                    path_to_state[neighbor] = path + [action]
+            visited_states.add(state)
+            # pbar.update(1)
+
+        # Save the path
+        paths_to_states_from_hubs.append(path_to_state)
+    # pbar.close()
+
+distances = np.full((num_states, num_states), np.inf)
+
+# Init distance from start to end as 1 + distance from 0 to end
+for state in range(num_states):
+    path_from_0_to_state = paths_to_states_from_hubs[0][state]
+    distance_from_0_to_state = len(path_from_0_to_state)
+    distances[:, state] = distance_from_0_to_state + 1
+
+for start in range(num_states):
+    paths = paths_to_states_from_hubs[start]
+    for end, path in paths.items():
+        distances[start, end] = len(path)
+
+# Set distances to itself to inf
+for i in range(num_states):
+    distances[i, i] = np.inf
+
+# # Build 2 N x N matrix representing the shortest path from any state to any other state
+# # - dist[i,j] is the distance from state i to state j
+# # - pred[i,j] is the action to take from state i to reach state j
+# #   We add action num_actions to reset the environment (i.e. go back to the initial state)
+# distances = np.full((num_states, num_states), np.inf)
+# pred = np.full((num_states, num_states), -1, dtype=int)
+
+# # Setting distance to self as zero
+# for i in range(num_states):
+#     distances[i, i] = 0
+
+# # Set direct transitions
+# for s in range(num_states):
+#     for a in range(num_actions):
+#         next_state = transitions[s, a]
+#         if next_state != s:
+#             distances[s, next_state] = 1  # One step to transition
+#             pred[s, next_state] = a  # Action taken
+
+# # For all states set distance to 1 + distance from 0 to destination
+# # Set action as reset (num_actions)
+# for state in range(num_states):
+#     path_from_0_to_state = paths_to_states_from_hubs[0][state]
+#     distance_from_0_to_state = len(path_from_0_to_state)
+#     distances[:, state] = distance_from_0_to_state + 1
+#     pred[:, state] = num_actions
+
+# for state in range(num_states):
+#     path = paths_to_states_from_hubs[0][state]
+#     for action in path:
+#         next_state = transitions[state, action]
+#         distances[state, next_state] = 1
+#         pred[state, next_state] = action
+
 
 # Then go through the path and render the frames
 states_to_save = set(range(num_states)[::-1])
@@ -66,35 +134,35 @@ print("Render data shape:", render_data.shape)
 print("0 in states to save:", 0 in states_to_save)
 obs_data = np.zeros(obs_data_shape, dtype=np.float32)
 
-with tqdm(
-    total=num_states, desc="Rendering frames", unit="states", smoothing=0.1
-) as pbar:
-    i = 0
-    while states_to_save and i < 1000000:
-        obs, _ = env.reset()
-        tabular_state: int = 0  # First state
-        tabular_goal_state: int = states_to_save.pop()
-        states_to_save.add(tabular_goal_state)
-        path: List[int] = path_to_state[tabular_goal_state]
-        for action in path:
-            if (
-                tabular_state in states_to_save
-            ):  # We found on the way a state we want to save
-                rendered: np.ndarray = env.render(mode="rgb_array")
-                render_data[tabular_state] = rendered.astype(np.uint8)
-                obs_data[tabular_state] = obs
-                states_to_save.remove(tabular_state)
-                pbar.update(1)
-            obs, _, _, _, _ = env.step(action)
-            tabular_state = transitions[tabular_state, action]
-            i += 1
+# with tqdm(
+#     total=num_states, desc="Rendering frames", unit="states", smoothing=0.1
+# ) as pbar:
+#     i = 0
+#     while states_to_save and i < 1000000:
+#         obs, _ = env.reset()
+#         tabular_state: int = 0  # First state
+#         tabular_goal_state: int = states_to_save.pop()
+#         states_to_save.add(tabular_goal_state)
+#         path: List[int] = path_to_state[tabular_goal_state]
+#         for action in path:
+#             if (
+#                 tabular_state in states_to_save
+#             ):  # We found on the way a state we want to save
+#                 rendered: np.ndarray = env.render(mode="rgb_array")
+#                 render_data[tabular_state] = rendered.astype(np.uint8)
+#                 obs_data[tabular_state] = obs
+#                 states_to_save.remove(tabular_state)
+#                 pbar.update(1)
+#             obs, _, _, _, _ = env.step(action)
+#             tabular_state = transitions[tabular_state, action]
+#             i += 1
 
-        if tabular_goal_state in states_to_save:
-            render_data[tabular_goal_state] = env.render(mode="rgb_array")
-            obs_data[tabular_goal_state] = obs
-            states_to_save.remove(tabular_goal_state)
-            pbar.update(1)
-    pbar.close()
+#         if tabular_goal_state in states_to_save:
+#             render_data[tabular_goal_state] = env.render(mode="rgb_array")
+#             obs_data[tabular_goal_state] = obs
+#             states_to_save.remove(tabular_goal_state)
+#             pbar.update(1)
+#     pbar.close()
 
 # # Floyd version that does not work
 
@@ -203,77 +271,66 @@ with tqdm(
 
 #     return dist, pred
 
+visited_states = set()
+path_to_state = {
+    0: [],
+}  # Maps a state to the sequence of actions needed from the initial state to reach it.
+states_to_find = set()
+states_to_visit = [0]
 
-# visited_states = set()
-# path_to_state = {
-#     0: [],
-# }  # Maps a state to the sequence of actions needed from the initial state to reach it.
-# states_to_find = set()
-# states_to_visit = [0]
+# Then go through the path and render the frames
+states_to_save = set(range(num_states))
+render_data = np.zeros(render_data_shape, dtype=np.uint8)
+obs_data = np.zeros(obs_data_shape, dtype=np.float32)
 
-# # First find a path to each state
-# dist, pred = floyd_warshall(transitions)
+with tqdm(
+    total=num_states, desc="Rendering frames", unit="states", smoothing=0.1
+) as pbar:
+    obs, _ = env.reset()
+    tabular_state: int = 0  # First state
 
-# # Then go through the path and render the frames
-# states_to_save = set(range(num_states))
-# render_data = np.zeros(render_data_shape, dtype=np.uint8)
-# obs_data = np.zeros(obs_data_shape, dtype=np.float32)
+    # Save the first state
+    render_data[tabular_state] = env.render(mode="rgb_array")
+    obs_data[tabular_state] = obs
+    states_to_save.remove(tabular_state)
+    distances[:, tabular_state] = np.inf
+    pbar.update(1)
 
-# with tqdm(
-#     total=num_states, desc="Rendering frames", unit="states", smoothing=0.1
-# ) as pbar:
-#     obs, _ = env.reset()
-#     tabular_state: int = 0  # First state
+    while states_to_save:
+        # Choose a goal state
+        # Greedy: we choose the closest one
+        local_dist = distances[tabular_state, :]
+        tabular_goal_state: int = np.argmin(local_dist)
+        # print("Goal state:", tabular_goal_state)
 
-#     # Save the first state
-#     render_data[tabular_state, :] = env.render(mode="rgb_array")
-#     obs_data[tabular_state, :] = obs
-#     states_to_save.remove(tabular_state)
-#     dist[:, tabular_state] = np.inf
-#     pbar.update(1)
+        if tabular_goal_state not in paths_to_states_from_hubs[tabular_state]:
+            # No direct path to the goal state, we need to reset
+            # print("No direct path to the goal state, we need to reset")
+            tabular_state = 0
+            obs, _ = env.reset()
+        else:
+            # Find the path to the goal state
+            path: List[int] = paths_to_states_from_hubs[tabular_state][
+                tabular_goal_state
+            ]
+            # print("Path:", path)
 
-#     while states_to_save:
-#         # Choose a goal state
-#         # Greedy: we choose the closest one
-#         distances = dist[tabular_state, :]
-#         tabular_goal_state: int = np.argmin(distances)
-#         print("Goal state:", tabular_goal_state)
+            for action in path:
+                obs, _, _, _, _ = env.step(action)
+                tabular_state = transitions[tabular_state, action]
 
-#         # If the distance is infinity, we have reached a dead end
-#         if distances[tabular_goal_state] == np.inf:
-#             if tabular_state == 0:
-#                 raise ValueError(
-#                     "Stuck, no more states to visit from the initial state."
-#                 )
+                if tabular_state in states_to_save:
+                    # We found on the way a state we want to save
+                    rendered: np.ndarray = env.render(mode="rgb_array")
+                    render_data[tabular_state] = rendered.astype(np.uint8)
+                    obs_data[tabular_state] = obs
+                    states_to_save.remove(tabular_state)
+                    distances[:, tabular_state] = np.inf
+                    pbar.update(1)
 
-#             tabular_state = 0
-#             obs, _ = env.reset()
-#             # print("Resetting the environment.")
-#             continue
+        # print("New state:", tabular_state)
 
-#         # print("Distance to goal state:", distances[tabular_goal_state])
-
-#         while tabular_state != tabular_goal_state:
-#             action = pred[tabular_state, tabular_goal_state]
-#             tabular_state = transitions[tabular_state, action]
-
-#             if tabular_state in states_to_save:
-#                 render_data[tabular_state, :] = env.render(mode="rgb_array")
-#                 obs_data[tabular_state, :] = obs
-#                 states_to_save.remove(tabular_state)
-
-#                 # Set the distance to this state to infinity so that we don't choose it
-#                 dist[:, tabular_state] = np.inf
-
-#                 pbar.update(1)
-
-#             if tabular_state == num_states - 1:
-#                 obs, _ = env.reset()
-#                 tabular_state = 0
-#                 print("Resetting the environment because we reached the end.")
-#                 break
-
-#     pbar.close()
+    pbar.close()
 
 # Save the data
 np.save(f"render_data_{mdp_name}.npy", render_data)
