@@ -19,9 +19,7 @@ register_atari_envs()
 
 mdp_name = "atlantis_50_fs30"  # Replace with the name of the BRIDGE MDP.v
 
-transitions, rewards = load_mdp_from_npz(
-    f"/home/josselin/Downloads/bridge_dataset/mdps/{mdp_name}/consolidated.npz"
-)
+transitions, rewards = load_mdp_from_npz(f"data_atari/{mdp_name}/consolidated.npz")
 num_states, num_actions = transitions.shape
 env = gym.make(f"BRIDGE/{mdp_name}")
 obs, infos = env.reset()
