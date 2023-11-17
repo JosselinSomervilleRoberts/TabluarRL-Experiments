@@ -1,6 +1,7 @@
 # Filter warnings
 import warnings
 
+# Filter all warnings
 warnings.filterwarnings("ignore")
 
 from typing import List, Dict
@@ -14,10 +15,30 @@ from toolbox.printing import debug
 from effective_horizon.envs.deterministic_registration import register_atari_envs
 from tqdm import tqdm
 import random
+import argparse
 
 register_atari_envs()
 
-mdp_name = "atlantis_50_fs30"  # Replace with the name of the BRIDGE MDP.v
+parser = argparse.ArgumentParser()
+parser.add_argument("--env", type=str, default="atlantis_30_fs30")
+parser.add_argument("--compression", type=int, default=1)
+parser.add_argument("--gray", action="store_true")
+args = parser.parse_args()
+mdp_name = args.env
+
+
+def get_frame_processor(args) -> callable:
+    def process_frame(frame: np.ndarray) -> np.ndarray:
+        if args.gray:
+            frame = np.mean(frame, axis=-1)
+        if args.compression > 1:
+            frame = frame[:: args.compression, :: args.compression]
+        return frame
+
+    return process_frame
+
+
+process_frame = get_frame_processor(args)
 
 transitions, rewards = load_mdp_from_npz(f"data_atari/{mdp_name}/consolidated.npz")
 num_states, num_actions = transitions.shape
@@ -25,13 +46,16 @@ env = gym.make(f"BRIDGE/{mdp_name}")
 obs, infos = env.reset()
 
 frame = env.render(mode="rgb_array")
-render_shape = frame.shape
-render_data_shape = (num_states,) + render_shape
-render_data_size = np.prod(render_data_shape) * 4 / 1024**3
-obs_data_shape = (num_states,) + obs.shape
-obs_data_size = np.prod(obs_data_shape) * 4 / 1024**3
+render_shape = list(frame.shape)
+if args.gray:
+    render_shape = render_shape[:-1]
+if args.compression > 1:
+    render_shape[0] = (render_shape[0] + args.compression - 1) // args.compression
+    render_shape[1] = (render_shape[1] + args.compression - 1) // args.compression
+render_data_shape = (num_states,) + tuple(render_shape)
+render_data_size = np.prod(render_data_shape) / 1024**3
+print("Data shape:", render_data_shape)
 print(f"Estimated render data size: {render_data_size:.2f} GB")
-print(f"Estimated obs data size: {obs_data_size:.2f} GB")
 
 
 # First find a path to each state
@@ -129,8 +153,6 @@ for i in range(num_states):
 states_to_save = set(range(num_states)[::-1])
 render_data = np.zeros(render_data_shape, dtype=np.uint8)
 print("Render data shape:", render_data.shape)
-print("0 in states to save:", 0 in states_to_save)
-obs_data = np.zeros(obs_data_shape, dtype=np.float32)
 
 # with tqdm(
 #     total=num_states, desc="Rendering frames", unit="states", smoothing=0.1
@@ -279,7 +301,6 @@ states_to_visit = [0]
 # Then go through the path and render the frames
 states_to_save = set(range(num_states))
 render_data = np.zeros(render_data_shape, dtype=np.uint8)
-obs_data = np.zeros(obs_data_shape, dtype=np.float32)
 
 with tqdm(
     total=num_states, desc="Rendering frames", unit="states", smoothing=0.1
@@ -288,8 +309,7 @@ with tqdm(
     tabular_state: int = 0  # First state
 
     # Save the first state
-    render_data[tabular_state] = env.render(mode="rgb_array")
-    obs_data[tabular_state] = obs
+    render_data[tabular_state] = process_frame(env.render(mode="rgb_array"))
     states_to_save.remove(tabular_state)
     distances[:, tabular_state] = np.inf
     pbar.update(1)
@@ -319,9 +339,8 @@ with tqdm(
 
                 if tabular_state in states_to_save:
                     # We found on the way a state we want to save
-                    rendered: np.ndarray = env.render(mode="rgb_array")
+                    rendered: np.ndarray = process_frame(env.render(mode="rgb_array"))
                     render_data[tabular_state] = rendered.astype(np.uint8)
-                    obs_data[tabular_state] = obs
                     states_to_save.remove(tabular_state)
                     distances[:, tabular_state] = np.inf
                     pbar.update(1)
@@ -330,6 +349,14 @@ with tqdm(
 
     pbar.close()
 
+# Delete any objects that is not required anymore
+del env
+del obs
+del infos
+del transitions
+del rewards
+del distances
+del paths_to_states_from_hubs
+
 # Save the data
 np.save(f"render_data_{mdp_name}.npy", render_data)
-np.save(f"obs_data_{mdp_name}.npy", obs_data)
